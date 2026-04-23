@@ -2351,8 +2351,8 @@ class HLSProxy:
             
             if is_dlstreams:
                 ext = self.extractors.get("dlstreams")
-                if ext and hasattr(ext, "_last_activity"):
-                    ext._last_activity = time.time()
+                if ext and hasattr(ext, "_update_shared_activity"):
+                    ext._update_shared_activity()
 
             headers = dict(stream_headers)
             is_cccdn_stream = "cccdn.net" in segment_url
@@ -2451,8 +2451,8 @@ class HLSProxy:
 
             if is_dlstreams:
                 ext = self.extractors.get("dlstreams")
-                if ext and hasattr(ext, "_last_activity"):
-                    ext._last_activity = time.time()
+                if ext and hasattr(ext, "_update_shared_activity"):
+                    ext._update_shared_activity()
 
             headers = dict(stream_headers)
 

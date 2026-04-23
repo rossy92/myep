@@ -53,19 +53,46 @@ class DLStreamsExtractor:
         self._manifest_cache: dict[str, tuple[str, float]] = {}
         self._watchdog_task = asyncio.create_task(self._browser_watchdog())
 
+    def _get_shared_activity_time(self) -> float:
+        """Reads the last activity timestamp from a shared file (multi-worker friendly)."""
+        import os
+        activity_file = os.path.join(os.getcwd(), "dlstreams_activity.txt")
+        try:
+            if os.path.exists(activity_file):
+                with open(activity_file, "r") as f:
+                    return float(f.read().strip())
+        except Exception:
+            pass
+        return self._last_activity # Fallback to local memory
+
+    def _update_shared_activity(self):
+        """Updates the last activity timestamp in a shared file."""
+        import os
+        now = time.time()
+        self._last_activity = now
+        activity_file = os.path.join(os.getcwd(), "dlstreams_activity.txt")
+        try:
+            with open(activity_file, "w") as f:
+                f.write(str(now))
+        except Exception:
+            pass
+
     async def _browser_watchdog(self):
         while True:
             await asyncio.sleep(10)
             if self._browser and self._context:
-                if time.time() - self._last_activity > 30: # 30 secondi di inattività
+                last_activity = self._get_shared_activity_time()
+                if time.time() - last_activity > 30: # 30 secondi di inattività globale
                     try:
-                        logger.info("💤 Nessuna attività video per 30 secondi. Spegnimento browser in background...")
+                        # Only the 'owner' or the first one to notice tries to close properly
+                        logger.info("💤 Nessuna attività video globale per 30 secondi. Spegnimento browser condiviso...")
+                        # We use a try-except because another worker might have already closed it
                         await self._context.close()
                         await self._browser.close()
                         if self._playwright:
                             await self._playwright.stop()
-                    except Exception as e:
-                        logger.debug("DLStreams watchdog chiusura browser errore: %s", e)
+                    except Exception:
+                        pass # Likely already closed by another worker
                     finally:
                         self._context = None
                         self._browser = None
@@ -167,7 +194,7 @@ class DLStreamsExtractor:
                 await dummy_page.goto("about:blank")
                 logger.debug("⚓ Created Shared Anchor Page (about:blank)")
             
-            self._last_activity = time.time()
+            self._update_shared_activity()
             return self._playwright, self._browser, self._context
 
     def _get_header(self, name: str, default: str | None = None) -> str | None:
@@ -228,7 +255,7 @@ class DLStreamsExtractor:
             logger.debug("DLStreams warm-up failed for %s: %s", player_url, exc)
 
     async def fetch_key_via_browser(self, key_url: str, original_url: str) -> bytes | None:
-        self._last_activity = time.time()
+        self._update_shared_activity()
         cached = self._browser_key_cache.get(key_url)
         if cached:
             return cached
@@ -460,7 +487,7 @@ class DLStreamsExtractor:
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
         """Extracts the M3U8 URL and headers bypassing the public watch page."""
-        self._last_activity = time.time()
+        self._update_shared_activity()
         try:
             # Extract ID from URL or use as is if numeric
             channel_id = self._extract_channel_id(url)
