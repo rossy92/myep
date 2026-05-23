@@ -1,4 +1,4 @@
-FROM ghcr.io/realbestia1/easyproxy:latest
+FROM https://github.com/rossy92/myep.git
 
 ENV PORT=7860
 ENV ENABLE_WARP=true
