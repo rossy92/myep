@@ -865,7 +865,14 @@ class HLSProxyStreamingMixin:
 
 
         except (ClientPayloadError, ConnectionResetError, OSError) as e:
-            # Errori tipici di disconnessione del client
+            # Errori tipici di disconnessione del client (o proxy caduto/disconnesso mid-stream)
+            active_proxy = session_proxy or forced_proxy
+            if active_proxy:
+                logger.warning(
+                    "Proxy %s failed during stream fetch (payload/reset error): %r. Marking dead.",
+                    active_proxy, e
+                )
+                mark_proxy_dead(active_proxy)
             warp_retry_response = await retry_direct_after_warp(e)
             if warp_retry_response:
                 return warp_retry_response
@@ -878,6 +885,13 @@ class HLSProxyStreamingMixin:
             asyncio.TimeoutError,
         ) as e:
             # Errori di connessione upstream
+            active_proxy = session_proxy or forced_proxy
+            if active_proxy:
+                logger.warning(
+                    "Proxy %s failed connection to source: %r. Marking dead.",
+                    active_proxy, e
+                )
+                mark_proxy_dead(active_proxy)
             warp_retry_response = await retry_direct_after_warp(e)
             if warp_retry_response:
                 return warp_retry_response
@@ -887,6 +901,13 @@ class HLSProxyStreamingMixin:
         except Exception as e:
             err_msg = str(e)
             if "Connection lost" in err_msg or "Connection reset" in err_msg:
+                active_proxy = session_proxy or forced_proxy
+                if active_proxy:
+                    logger.warning(
+                        "Proxy %s connection lost/reset: %r. Marking dead.",
+                        active_proxy, e
+                    )
+                    mark_proxy_dead(active_proxy)
                 warp_retry_response = await retry_direct_after_warp(e)
                 if warp_retry_response:
                     return warp_retry_response
