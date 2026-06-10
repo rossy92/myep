@@ -94,9 +94,14 @@ class VixSrcExtractor:
             proxy = self._normalize_proxy_url(forced_proxy)
             return [proxy]
 
+        # Filter out WARP from fallback proxies when bypass is active
+        fallback = self.proxies
+        if self.bypass_warp_active and WARP_PROXY_URL:
+            fallback = [p for p in (self.proxies or []) if p != WARP_PROXY_URL and p != self._normalize_proxy_url(WARP_PROXY_URL)]
+
         dedicated = self._dedicated_proxies()
         if not dedicated:
-            return get_ordered_proxies_for_url(url, self.extractor_name, self.proxies, bypass_warp=self.bypass_warp_active)
+            return get_ordered_proxies_for_url(url, self.extractor_name, fallback, bypass_warp=self.bypass_warp_active)
 
         # Skip socket check - rely on DEAD_PROXIES + curl_cffi rotation for liveness
         now = time.time()
@@ -105,7 +110,7 @@ class VixSrcExtractor:
         if alive:
             return alive
         # All dedicated proxies dead — fall back to general resolution (direct, WARP, etc.)
-        return get_ordered_proxies_for_url(url, self.extractor_name, self.proxies, bypass_warp=self.bypass_warp_active)
+        return get_ordered_proxies_for_url(url, self.extractor_name, fallback, bypass_warp=self.bypass_warp_active)
 
     async def _preferred_proxy(self, url: str, forced_proxy: str | None = None) -> str | None:
         candidates = await self._proxy_candidates(url, forced_proxy)
