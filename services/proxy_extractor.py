@@ -142,7 +142,7 @@ class HLSProxyExtractorHandlerMixin:
                 url, dict(request.headers), host=host_param, bypass_warp=bypass_warp
             )
 
-            timeout = 90 if FLARESOLVERR_URL else 30
+            timeout = 60 if FLARESOLVERR_URL else 30
             result = await asyncio.wait_for(
                 extractor.extract(url, **extractor_kwargs), timeout=timeout
             )

@@ -163,13 +163,12 @@ async def ensure_flaresolverr() -> bool:
         logger.info("Starting FlareSolverr lazily from %s ...", fs_dir)
 
         try:
-            fs_log = open(os.path.join(fs_dir, "flaresolverr.log"), "a")
             _flaresolverr_process = await asyncio.create_subprocess_exec(
                 sys.executable, script,
                 cwd=fs_dir,
                 env={**os.environ, "PORT": "8191"},
-                stdout=fs_log,
-                stderr=asyncio.subprocess.STDOUT,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
             )
 
