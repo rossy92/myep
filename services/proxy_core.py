@@ -444,28 +444,14 @@ class HLSProxyCoreMixin:
 
     async def reconnect_warp(self) -> dict:
         """Reconnect WARP to get a new IP. Tries warp-cli first, then wireproxy kill+restart."""
-        warp_dir = os.environ.get("WARP_DIR", "/tmp/easyproxy-warp")
         result = {"status": "ok", "message": ""}
 
-        # Try warp-cli disconnect/connect first
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "warp-cli", "--accept-tos", "disconnect",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=10)
-            await asyncio.sleep(2)
-            proc = await asyncio.create_subprocess_exec(
-                "warp-cli", "--accept-tos", "connect",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=10)
+        if await _warp_cli_connect():
             result["message"] = "WARP reconnected via warp-cli"
             return result
-        except (FileNotFoundError, asyncio.TimeoutError):
-            pass
 
         # Fallback: wireproxy mode — kill, re-register, restart
+        warp_dir = os.environ.get("WARP_DIR", "/tmp/easyproxy-warp")
         try:
             # Kill existing wireproxy
             proc = await asyncio.create_subprocess_exec(
@@ -533,6 +519,14 @@ class HLSProxyCoreMixin:
             result["message"] = f"WARP reconnect failed: {e}"
 
         return result
+
+    async def _stop_warp_proxy(self):
+        for cmd in [["warp-cli", "--accept-tos", "disconnect"], ["pkill", "-9", "wireproxy"]]:
+            try:
+                proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
 
     async def _update_latest_version(self):
         """Periodically checks GitHub for the latest version in the background."""
@@ -969,3 +963,45 @@ class HLSProxyCoreMixin:
             self.captured_hls_manifest_map.clear()
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+
+async def _warp_cli_connect() -> bool:
+    """Standalone WARP warp-cli setup: disconnect, re-register, mode proxy, connect."""
+    import config_store, services.proxy_shared as _shared
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "warp-cli", "--accept-tos", "disconnect",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=10)
+        await asyncio.sleep(2)
+        proc = await asyncio.create_subprocess_exec(
+            "warp-cli", "--accept-tos", "registration", "delete",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=10)
+        proc = await asyncio.create_subprocess_exec(
+            "warp-cli", "--accept-tos", "registration", "new",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=10)
+        license_key = _shared.WARP_LICENSE_KEY or config_store.get("warp_license_key", "")
+        if license_key:
+            proc = await asyncio.create_subprocess_exec(
+                "warp-cli", "--accept-tos", "registration", "license", license_key,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        for sub_cmd in [["mode", "proxy"], ["proxy", "port", "1080"]]:
+            proc = await asyncio.create_subprocess_exec(
+                "warp-cli", "--accept-tos", *sub_cmd,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        proc = await asyncio.create_subprocess_exec(
+            "warp-cli", "--accept-tos", "connect",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=10)
+        return True
+    except (FileNotFoundError, asyncio.TimeoutError):
+        return False

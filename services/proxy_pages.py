@@ -728,15 +728,17 @@ class HLSProxyPagesMixin:
         reload_config()
         clear_proxy_affinity()
         self.extractors.clear()
-        self._warp_check_ts = 0  # Force refresh on next status check
 
-        status = "enabled" if enable else "disabled"
         if enable:
             logger.info("WARP enabled via admin panel")
+            await self.reconnect_warp()
         else:
             logger.info("WARP disabled via admin panel")
+            await self._stop_warp_proxy()
 
-        return web.json_response({"status": "ok", "warp": status})
+        self._warp_check_ts = 0  # Force refresh on next status check
+
+        return web.json_response({"status": "ok", "warp": "enabled" if enable else "disabled"})
 
     async def handle_admin_api_warp_reconnect(self, request):
         if not check_password(request):

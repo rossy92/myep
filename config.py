@@ -211,6 +211,14 @@ def _get_dynamic_warp_exclude_domains() -> list:
             merged.append(d)
     return merged
 
+def _is_warp_excluded(url: str) -> bool:
+    normalized = url.lower()
+    for domain in _WARP_EXCLUDE_DOMAINS:
+        stripped = domain.lstrip("*.")
+        if stripped in normalized:
+            return True
+    return False
+
 def _get_dynamic_global_proxies() -> list:
     return _cfg_get("global_proxies", [])
 
@@ -281,7 +289,7 @@ def get_ordered_proxies_for_url(
     if bypass_warp is None:
         bypass_warp = BYPASS_WARP_CONTEXT.get()
     normalized_url = (url or "").lower()
-    is_excluded = any(domain in normalized_url for domain in _WARP_EXCLUDE_DOMAINS)
+    is_excluded = _is_warp_excluded(url or "")
     if _ENABLE_WARP and not bypass_warp and not is_excluded:
         add(_WARP_PROXY_URL)
 
@@ -493,7 +501,7 @@ def get_proxy_for_url(url: str, transport_routes: list = None, global_proxies: l
         if time.time() - timestamp < 120 and is_proxy_alive(cached_proxy):
             # If cached proxy is WARP, validate WARP is still enabled
             if cached_proxy == _WARP_PROXY_URL:
-                is_excluded = any(domain in url.lower() for domain in _WARP_EXCLUDE_DOMAINS)
+                is_excluded = _is_warp_excluded(url)
                 if _ENABLE_WARP and not bypass_warp and not is_excluded:
                     return cached_proxy
                 # WARP no longer valid, remove from cache
@@ -544,7 +552,7 @@ def get_proxy_for_url(url: str, transport_routes: list = None, global_proxies: l
         return proxy
 
     # Check if WARP should be used only when no explicit proxy is configured.
-    is_excluded = any(domain in normalized_url for domain in _WARP_EXCLUDE_DOMAINS)
+    is_excluded = _is_warp_excluded(url)
 
     if _ENABLE_WARP and not bypass_warp and not is_excluded:
         warp_alive = is_proxy_alive(_WARP_PROXY_URL)
@@ -666,7 +674,7 @@ API_PASSWORD = os.environ.get("API_PASSWORD")
 PORT = int(os.environ.get("PORT", 7860))
 
 # --- Version/Mode Configuration ---
-APP_VERSION = "2.9.02"
+APP_VERSION = "2.9.03"
 
 _has_solvers = os.path.exists("flaresolverr")
 VERSION_MODE = "Full" if _has_solvers else "Light"
