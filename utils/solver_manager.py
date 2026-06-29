@@ -29,15 +29,26 @@ def _patch_playwright_bug():
                 try:
                     with open(p, "r", encoding="utf-8") as f:
                         content = f.read()
-                    target = "url: pageError.location.url,"
-                    replacement = 'url: pageError.location ? pageError.location.url : "",'
-                    if target in content:
-                        patched_content = content.replace(target, replacement)
+                    
+                    replacements = {
+                        "url: pageError.location.url,": 'url: pageError.location ? pageError.location.url : "",',
+                        "line: pageError.location.lineNumber,": 'line: pageError.location ? pageError.location.lineNumber : 0,',
+                        "column: pageError.location.columnNumber,": 'column: pageError.location ? pageError.location.columnNumber : 0,',
+                        "column: pageError.location.column,": 'column: pageError.location ? pageError.location.column : 0,',
+                    }
+                    
+                    patched = False
+                    for target, rep in replacements.items():
+                        if target in content:
+                            content = content.replace(target, rep)
+                            patched = True
+                            
+                    if patched:
                         with open(p, "w", encoding="utf-8") as f:
-                            f.write(patched_content)
-                        logger.info(f"[Patch] Successfully patched Playwright bug in {p}")
-                    elif replacement in content:
-                        logger.info(f"[Patch] Playwright bug already patched in {p}")
+                            f.write(content)
+                        logger.info(f"[Patch] Successfully patched Playwright coreBundle.js in {p}")
+                    else:
+                        logger.info(f"[Patch] Playwright bug already patched or clean in {p}")
                 except Exception as e:
                     logger.warning(f"[Patch] Failed to patch Playwright at {p}: {e}")
                 break
