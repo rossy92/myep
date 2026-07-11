@@ -1,426 +1,362 @@
-from services.proxy_shared import *
+import asyncio
+import gc
+import hmac
+import logging
+import os
+import re
+import time
+import urllib.parse
+import aiohttp
+import base64
+import hashlib
+import socket
+import config_store
+
+import services.proxy_shared as _shared
+from services.proxy_shared import (
+    logger,
+    SELECTED_PROXY_CONTEXT,
+    STRICT_PROXY_CONTEXT,
+    get_proxy_for_url,
+    get_connector_for_proxy,
+    get_extractor_proxies,
+    mark_proxy_dead,
+    BYPASSED_WARP_DOMAINS,
+    ClientSession,
+    ClientTimeout,
+    TCPConnector,
+    is_dynamic_warp_bypass_candidate,
+    prefer_default_family_for_url,
+    resolve_extractor,
+)
+class SharedSessionWrapper:
+    def __init__(self, session):
+        object.__setattr__(self, "_session", session)
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._session, name, value)
+
+    @property
+    def closed(self) -> bool:
+        return self._session.closed
+
+    async def close(self):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
 
 class HLSProxyCoreMixin:
 
+    @staticmethod
+    def _pow_search(hmac_hash: str, resource: str, number: str, ts: int, max_iter: int) -> int:
+        """CPU-bound PoW search, intended for run_in_executor."""
+        import hashlib as _hl
+        for i in range(max_iter):
+            combined = f"{hmac_hash}{resource}{number}{ts}{i}"
+            md5_hash = _hl.md5(combined.encode("utf-8")).hexdigest()
+            prefix_value = int(md5_hash[:4], 16)
+            if prefix_value < 0x1000:
+                return i
+        return 0
+
     async def shorten_hls_url(self, url: str) -> str:
-        """Crea un ID breve per un URL e lo memorizza nella mappa."""
+        """Codifica l'URL direttamente in base64 (nessuna memoria usata per mappe)."""
         if not url:
             return ""
-        now = time.time()
-        current_ttl = hls_url_ttl_for(
-            url,
-            self.hls_url_ttl,
-            self.hls_url_extended_ttl,
-        )
-        expired_keys = [
-            key for key, (_, ts, ttl) in self.hls_url_map.items()
-            if now - ts > ttl
-        ]
-        for key in expired_keys:
-            self.hls_url_map.pop(key, None)
-
-        if len(self.hls_url_map) >= self.hls_url_max_entries:
-            oldest_keys = sorted(
-                self.hls_url_map.items(),
-                key=lambda item: item[1][1]
-            )[: max(1, len(self.hls_url_map) - self.hls_url_max_entries + 1)]
-            for key, _ in oldest_keys:
-                self.hls_url_map.pop(key, None)
-
-        # Usa un hash corto (12 caratteri) per l'URL
-        url_id = f"u_{hashlib.md5(url.encode()).hexdigest()[:12]}"
-        self.hls_url_map[url_id] = (url, now, current_ttl)
-        return url_id
-
-    def _refresh_segment_token(self, segment_url: str) -> str | None:
-        """
-        For signed-token CDN URLs (VidXgo, VixSrc/StreamVix, etc.), rewrite the
-        query of the requested segment so it uses the freshest token currently
-        known in `captured_hls_manifest_map`. Matches by segment path: the
-        path component (everything before `?`) is stable across token
-        rotations, while the query holds the rotating token.
-
-        Returns the rewritten URL, or None if no match (caller falls back to
-        the original URL).
-        """
-        try:
-            parsed = urllib.parse.urlparse(segment_url)
-        except Exception:
-            return None
-        if not parsed.query:
-            return None
-        seg_path = parsed.path
-        if not seg_path:
-            return None
-        # Only meaningful for hosts that put a rotating token in the query.
-        # VidXgo uses `e=` (ms epoch); VixSrc/StreamVix uses `token/expires`.
-        q = urllib.parse.parse_qs(parsed.query)
-        if "e" not in q and not ({"token", "expires"} <= set(q)):
-            return None
-        # Scan all captured variant manifests. The most recently refreshed
-        # one wins (highest stored_at).
-        candidates = []
-        for entry in self.captured_hls_manifest_map.values():
-            captured_url, captured_manifest, _, stored_at, _, _ = entry
-            if not captured_manifest:
-                continue
-            # Signed CDNs may rotate hostnames and path prefixes together with
-            # tokens, so match the stable tail rather than the full URL/path.
-            for abs_seg in self._iter_hls_manifest_urls(captured_url, captured_manifest):
-                cand = urllib.parse.urlparse(abs_seg)
-                if self._segment_paths_match(seg_path, cand.path):
-                    candidates.append((stored_at, abs_seg))
-                    break
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        fresh_url = candidates[0][1]
-        if fresh_url == segment_url:
-            return None
-        logger.debug("Refreshed segment token: %s -> %s", segment_url[-60:], fresh_url[-60:])
-        return fresh_url
-
-    async def _refresh_captured_hls_for_segment(self, segment_url: str) -> bool:
-        """Re-extract a captured HLS source that contains the requested segment."""
-        matches = self._captured_hls_matches_for_segment(segment_url)
-
-        seen_sources = set()
-        for _, source_url, captured_headers, entry_ttl in sorted(matches, key=lambda item: item[0], reverse=True):
-            if source_url in seen_sources:
-                continue
-            seen_sources.add(source_url)
-            try:
-                extractor = await self.get_extractor(source_url, captured_headers)
-                refreshed = await extractor.extract(
-                    source_url,
-                    request_headers=captured_headers,
-                    force_refresh=True,
-                    background_refresh=True,
-                )
-                refreshed_headers = refreshed.get("request_headers", captured_headers)
-                refreshed_manifests = list((refreshed.get("captured_manifests") or {}).items())
-                if not refreshed_manifests and refreshed.get("captured_manifest"):
-                    refreshed_manifests = [(
-                        refreshed.get("destination_url"),
-                        refreshed.get("captured_manifest"),
-                    )]
-
-                stored_any = False
-                for refreshed_url, refreshed_manifest in refreshed_manifests:
-                    if not refreshed_url or not refreshed_manifest:
-                        continue
-                    await self.store_captured_hls_manifest(
-                        refreshed_url,
-                        refreshed_manifest,
-                        refreshed_headers,
-                        ttl=entry_ttl,
-                        source_url=source_url,
-                    )
-                    stored_any = True
-                if stored_any:
-                    logger.info("captured HLS refreshed on segment 403: %s", source_url)
-                    return True
-            except Exception as exc:
-                logger.debug("Captured HLS on-demand refresh failed for %s: %s", source_url, exc)
-        return False
-
-    def _schedule_segment_count_refresh(self, segment_url: str, threshold: int = 10) -> bool:
-        """Refresh VixSrc before its approximate 12-segment token limit."""
-        if not self._is_vixsrc_signed_segment(segment_url):
-            return False
-
-        matches = self._captured_hls_matches_for_segment(segment_url)
-        if not matches:
-            return False
-
-        _, source_url, _, _ = sorted(matches, key=lambda item: item[0], reverse=True)[0]
-        count_key = f"vixsrc|{source_url}"
-        counts = getattr(self, "captured_hls_segment_counts", None)
-        if counts is None:
-            self.captured_hls_segment_counts = {}
-            counts = self.captured_hls_segment_counts
-        current_count = counts.get(count_key, 0) + 1
-
-        if current_count < threshold:
-            counts[count_key] = current_count
-            return False
-
-        counts[count_key] = 0
-        tasks = getattr(self, "captured_hls_segment_refresh_tasks", None)
-        if tasks is None:
-            self.captured_hls_segment_refresh_tasks = {}
-            tasks = self.captured_hls_segment_refresh_tasks
-        existing_task = tasks.get(count_key)
-        if existing_task and not existing_task.done():
-            return False
-
-        async def refresh_in_background():
-            refreshed = await self._refresh_captured_hls_for_segment(segment_url)
-            if refreshed:
-                logger.info(
-                    "captured HLS proactive refresh after %d VixSrc segments: %s",
-                    threshold,
-                    source_url,
-                )
-
-        task = asyncio.create_task(refresh_in_background())
-        tasks[count_key] = task
-        task.add_done_callback(lambda _task, key=count_key: tasks.pop(key, None))
-        return True
-
-    def _captured_hls_matches_for_segment(self, segment_url: str):
-        try:
-            parsed = urllib.parse.urlparse(segment_url)
-        except Exception:
-            return []
-        if not parsed.path:
-            return []
-
-        matches = []
-        for entry in self.captured_hls_manifest_map.values():
-            captured_url, captured_manifest, captured_headers, stored_at, entry_ttl, source_url = entry
-            if not captured_manifest or not source_url:
-                continue
-            for abs_seg in self._iter_hls_manifest_urls(captured_url, captured_manifest):
-                cand = urllib.parse.urlparse(abs_seg)
-                if self._segment_paths_match(parsed.path, cand.path):
-                    matches.append((stored_at, source_url, captured_headers, entry_ttl))
-                    break
-        return matches
-
-    @staticmethod
-    def _is_vixsrc_signed_segment(segment_url: str) -> bool:
-        try:
-            parsed = urllib.parse.urlparse(segment_url)
-            params = urllib.parse.parse_qs(parsed.query)
-        except Exception:
-            return False
-        host = parsed.netloc.lower()
-        return "vix-content.net" in host and {"token", "expires"} <= set(params)
-
-    @staticmethod
-    def _iter_hls_manifest_urls(captured_url: str, captured_manifest: str):
-        base_query = urllib.parse.urlparse(captured_url).query
-        for line in captured_manifest.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            abs_url = urllib.parse.urljoin(captured_url, line)
-            parsed_abs = urllib.parse.urlparse(abs_url)
-            if base_query and not parsed_abs.query:
-                abs_url = urllib.parse.urlunparse(parsed_abs._replace(query=base_query))
-            yield abs_url
-
-    @staticmethod
-    def _parse_signed_expiry_ts(u: str) -> float | None:
-        """Parse HLS signed URL expiry from VidXgo `e=` or VixSrc `expires=`."""
-        try:
-            params = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
-            raw_e = params.get("e", [None])[0]
-            if raw_e:
-                return float(raw_e) / 1000.0
-            raw_expires = params.get("expires", [None])[0]
-            if raw_expires:
-                return float(raw_expires)
-        except Exception:
-            return None
-        return None
-
-    @staticmethod
-    def _segment_paths_match(old_path: str, candidate_path: str) -> bool:
-        if old_path == candidate_path:
-            return True
-
-        old_parts = [part for part in old_path.split("/") if part]
-        candidate_parts = [part for part in candidate_path.split("/") if part]
-        if not old_parts or not candidate_parts:
-            return False
-
-        if old_parts[-1] != candidate_parts[-1]:
-            return False
-
-        common_tail = min(3, len(old_parts), len(candidate_parts))
-        return old_parts[-common_tail:] == candidate_parts[-common_tail:]
-
-    async def store_captured_hls_manifest(
-        self,
-        url: str,
-        manifest: str,
-        headers: dict,
-        ttl: int = 30,
-        source_url: str = None,
-    ) -> str:
-        now = time.time()
-        expired_keys = [
-            key for key, (_, _, _, ts, entry_ttl, _) in self.captured_hls_manifest_map.items()
-            if now - ts > entry_ttl
-        ]
-        for key in expired_keys:
-            self.captured_hls_manifest_map.pop(key, None)
-
-        stable_key = self._captured_manifest_stable_key(source_url, url)
-        url_id = f"cm_{hashlib.md5(stable_key.encode()).hexdigest()[:12]}"
-        self.captured_hls_manifest_map[url_id] = (url, manifest, headers, now, ttl, source_url)
-        self.hls_url_map[url_id] = (url, now, ttl)
-        if source_url and (
-            url_id not in self.captured_hls_refresh_tasks
-            or self.captured_hls_refresh_tasks[url_id].done()
-        ):
-            async def refresh_loop():
-                while url_id in self.captured_hls_manifest_map:
-                    await asyncio.sleep(2)
-                    entry = self.captured_hls_manifest_map.get(url_id)
-                    if not entry:
-                        break
-                    captured_url, _, captured_headers, stored_at, entry_ttl, entry_source_url = entry
-                    # Prefer the actual signed-URL expiry when present,
-                    # falling back to the static entry_ttl window.
-                    expiry_ts = self._parse_signed_expiry_ts(captured_url)
-                    now_ts = time.time()
-                    if expiry_ts is not None:
-                        seconds_left = expiry_ts - now_ts
-                    else:
-                        seconds_left = entry_ttl - (now_ts - stored_at)
-                    # Refresh proactively when <60s remain on the token.
-                    if seconds_left > 60:
-                        continue
-                    # Hard GC only if the entry is long-dead AND no signed URL
-                    # to consult (avoid evicting entries that still have valid e=).
-                    if expiry_ts is None and now_ts - stored_at > entry_ttl:
-                        self.captured_hls_manifest_map.pop(url_id, None)
-                        break
-                    try:
-                        extractor = await self.get_extractor(
-                            entry_source_url,
-                            captured_headers,
-                        )
-                        refreshed = await extractor.extract(
-                            entry_source_url,
-                            request_headers=captured_headers,
-                            force_refresh=True,
-                            background_refresh=True,
-                        )
-                        captured_stable_key = self._captured_manifest_stable_key(
-                            entry_source_url,
-                            captured_url,
-                        )
-                        refreshed_manifests = list(
-                            (refreshed.get("captured_manifests") or {}).items()
-                        )
-                        if not refreshed_manifests and refreshed.get("captured_manifest"):
-                            refreshed_manifests = [(
-                                refreshed.get("destination_url"),
-                                refreshed.get("captured_manifest"),
-                            )]
-                        for refreshed_url, refreshed_manifest in reversed(refreshed_manifests):
-                            if refreshed_url and self._captured_manifest_stable_key(
-                                entry_source_url,
-                                refreshed_url,
-                            ) == captured_stable_key:
-                                refreshed_headers = refreshed.get("request_headers", captured_headers)
-                                # CRITICAL: bump stored_at so the entry is not
-                                # GC'd by the entry_ttl check above, and so the
-                                # next refresh cycle uses the fresh signed URL
-                                # to compute seconds_left.
-                                self.captured_hls_manifest_map[url_id] = (
-                                    refreshed_url,
-                                    refreshed_manifest,
-                                    refreshed_headers,
-                                    time.time(),
-                                    entry_ttl,
-                                    entry_source_url,
-                                )
-                                logger.info(
-                                    "captured HLS refreshed %s (token_left=%.0fs)",
-                                    entry_source_url,
-                                    (self._parse_signed_expiry_ts(refreshed_url) or 0) - time.time(),
-                                )
-                                break
-                    except Exception as exc:
-                        logger.debug("Captured HLS background refresh failed for %s: %s", entry_source_url, exc)
-
-            self.captured_hls_refresh_tasks[url_id] = asyncio.create_task(refresh_loop())
-        return url_id
-
-    @staticmethod
-    def _captured_manifest_stable_key(source_url: str | None, manifest_url: str) -> str:
-        if not source_url:
-            return manifest_url
-
-        parsed = urllib.parse.urlparse(manifest_url)
-        path_parts = [part for part in parsed.path.split("/") if part]
-        suffix = "/".join(path_parts[-3:]) or manifest_url
-        volatile_params = {"token", "expires", "asn", "edge"}
-        stable_params = [
-            (key, value)
-            for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-            if key.lower() not in volatile_params
-        ]
-        stable_query = urllib.parse.urlencode(stable_params)
-        if stable_query:
-            suffix = f"{suffix}?{stable_query}"
-        return f"{source_url}|{suffix}"
+        encoded = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        return f"u_{encoded}"
 
     async def start_tasks(self):
         """Starts background tasks for the proxy."""
+        self._last_warp_reconnect_time = time.time()  # ponytail: startup cooldown to allow initial handshake
         asyncio.create_task(self._update_latest_version())
-        # Always start WARP check (universal trace method)
-        asyncio.create_task(self._update_warp_status_loop())
+        asyncio.create_task(self._cleanup_stale_sessions())
+        asyncio.create_task(self._warp_keepalive())
 
-    async def _update_warp_status_loop(self):
-        """Periodically checks WARP status via Cloudflare trace (Universal)."""
+    async def _cleanup_stale_sessions(self):
+        """Periodic cleanup of stale CDN tokens and idle proxy sessions to prevent memory accumulation when idle."""
         while True:
             try:
-                # We use the proxy session to check if the SOCKS5H proxy is working
-                session, _ = await self._get_proxy_session("https://www.cloudflare.com/cdn-cgi/trace")
-                async with session.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=5) as resp:
-                    if resp.status == 200:
-                        text = await resp.text()
-                        if "warp=on" in text:
-                            self.warp_status = "Connected"
-                        else:
-                            self.warp_status = "Disconnected"
-                    else:
-                        self.warp_status = "Error"
-            except Exception:
-                self.warp_status = "Disconnected"
+                await asyncio.sleep(60)
+                now = time.time()
+                
+                # 1. Clean up stale HLS/CDN tokens (>300s)
+                stale_tokens = [
+                    k for k, t in getattr(self, '_renewed_cdn_token_atimes', {}).items()
+                    if now - t > 300
+                ]
+                for k in stale_tokens:
+                    self._renewed_cdn_tokens.pop(k, None)
+                    self._renewed_cdn_token_atimes.pop(k, None)
+                    logger.debug("🧹 Cleaned stale CDN token: %s", k[:8])
+                
+                # 2. Clean up idle proxy sessions (>60s)
+                if hasattr(self, "_proxy_sessions") and hasattr(self, "_proxy_session_atimes"):
+                    _warp_url = _shared.WARP_PROXY_URL
+                    stale_proxies = [
+                        p for p, t in list(self._proxy_session_atimes.items())
+                        if now - t > 60 and p != _warp_url
+                    ]
+                    for p in stale_proxies:
+                        p_sess = self._proxy_sessions.pop(p, None)
+                        self._proxy_session_atimes.pop(p, None)
+                        if p_sess and not p_sess.closed:
+                            await p_sess.close()
+                            logger.info(f"[NET] Closed idle proxy session: {p}")
 
-            await asyncio.sleep(60) # Check every minute
+                # 3. Close shared session if idle >30s
+                _session_atime = getattr(self, "_session_atime", 0)
+                if _session_atime and now - _session_atime > 30:
+                    if self.session and not self.session.closed:
+                        await self.session.close()
+                        logger.info("[NET] Closed idle shared session (idle %.0fs)", now - _session_atime)
+                    self.session = None
+                    if self.flex_session and not self.flex_session.closed:
+                        await self.flex_session.close()
+                        logger.info("[NET] Closed idle flex session (idle %.0fs)", now - _session_atime)
+                    self.flex_session = None
+
+                # 4. Compact Windows heap to release freed pages
+                await self._compact_heap()
+
+            except Exception as e:
+                logger.error("Cleanup stale sessions error: %s", e)
+                await asyncio.sleep(10)
+
+    async def _compact_heap(self):
+        """Release freed heap pages back to the OS (Linux: malloc_trim, Windows: HeapCompact)."""
+        try:
+            gc.collect()
+            import ctypes
+            import platform
+            if platform.system() == "Windows":
+                ctypes.windll.kernel32.HeapCompact(
+                    ctypes.windll.kernel32.GetProcessHeap(), 0
+                )
+            else:
+                try:
+                    libc = ctypes.CDLL("libc.so.6")
+                    libc.malloc_trim(0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+    async def _warp_keepalive(self):
+        """Periodically test WARP tunnel and reconnect if down. Never marks WARP dead."""
+        while True:
+            try:
+                await asyncio.sleep(30)
+                _ENABLE_WARP = _shared.ENABLE_WARP
+                _WARP_PROXY_URL = _shared.WARP_PROXY_URL
+                if not _ENABLE_WARP or not _WARP_PROXY_URL:
+                    continue
+                try:
+                    connector = get_connector_for_proxy(
+                        _WARP_PROXY_URL, limit=0, family=socket.AF_INET
+                    )
+                    timeout = ClientTimeout(total=8)
+                    async with ClientSession(connector=connector, timeout=timeout) as session:
+                        async with session.get("https://api.ipify.org?format=json") as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                self._warp_ip = data.get("ip", "")
+                                continue
+                except Exception:
+                    pass
+                logger.warning("WARP tunnel down, reconnecting...")
+                result = await self.reconnect_warp()
+                if result.get("status") == "ok":
+                    logger.info("WARP reconnected: %s", result.get("message"))
+                else:
+                    logger.error("WARP reconnect failed: %s", result.get("message"))
+            except Exception as e:
+                logger.error("WARP keepalive error: %s", e)
+                await asyncio.sleep(10)
+
+    async def get_warp_status(self) -> str:
+        """Returns WARP status and fetches real external IP through WARP proxy."""
+        _ENABLE_WARP = _shared.ENABLE_WARP
+        _WARP_PROXY_URL = _shared.WARP_PROXY_URL
+        result = "Disconnected"
+        if _ENABLE_WARP and _WARP_PROXY_URL:
+            # Quick socket test to 127.0.0.1:1080 (no DNS, always fast)
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection("127.0.0.1", 1080), timeout=3
+                )
+                writer.close()
+                result = "Connected"
+                # Try to fetch the WARP IP via the proxy
+                try:
+                    connector = get_connector_for_proxy(
+                        _WARP_PROXY_URL, limit=0, family=socket.AF_INET
+                    )
+                    async with ClientSession(connector=connector, timeout=ClientTimeout(total=10)) as session:
+                        async with session.get("https://api.ipify.org?format=json") as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                self._warp_ip = data.get("ip", "")
+                except Exception:
+                    pass
+            except (OSError, asyncio.TimeoutError):
+                pass
+        return result
+
+    async def reconnect_warp(self) -> dict:
+        """Reconnect WARP to get a new IP. Tries warp-cli first, then wireproxy kill+restart."""
+        if not hasattr(self, "_warp_reconnect_lock"):
+            self._warp_reconnect_lock = asyncio.Lock()
+
+        now = time.time()
+        last_reconnect = getattr(self, "_last_warp_reconnect_time", 0)
+        if now - last_reconnect < 60:
+            logger.warning("WARP reconnected recently (cooldown active: %.1fs remaining). Skipping reconnect.", 60 - (now - last_reconnect))
+            return {"status": "ok", "message": "Cooldown active"}
+
+        if self._warp_reconnect_lock.locked():
+            logger.warning("WARP reconnect already in progress. Skipping redundant request.")
+            return {"status": "ok", "message": "Reconnect already in progress"}
+
+        async with self._warp_reconnect_lock:
+            self._last_warp_reconnect_time = time.time()
+            logger.info("🔄 Starting WARP reconnection...")
+            result = {"status": "ok", "message": ""}
+
+            if await _warp_cli_connect():
+                result["message"] = "WARP reconnected via warp-cli"
+                logger.info("✅ %s", result["message"])
+                return result
+
+            # Fallback: wireproxy mode — kill, re-register, restart
+            warp_dir = os.environ.get("WARP_DIR", "/tmp/easyproxy-warp")
+            _kill_wireproxy()
+            await asyncio.sleep(1)
+
+            try:
+                # Remove old registration to force new IP
+                acct_file = os.path.join(warp_dir, "wgcf-account.toml")
+                if os.path.exists(acct_file):
+                    os.remove(acct_file)
+
+                # Re-register and start wireproxy
+                proc = await asyncio.create_subprocess_exec(
+                    "wgcf", "register", "--accept-tos",
+                    cwd=warp_dir,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=15)
+
+                license_key = _shared.WARP_LICENSE_KEY or config_store.get("warp_license_key", "")
+                if license_key:
+                    proc = await asyncio.create_subprocess_exec(
+                        "wgcf", "update", "--license-key", license_key,
+                        cwd=warp_dir,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+
+                # Generate wireproxy config
+                profile = os.path.join(warp_dir, "wgcf-profile.conf")
+                if os.path.exists(profile):
+                    os.remove(profile)
+                wp_conf = os.path.join(warp_dir, "wireproxy.conf")
+                if os.path.exists(wp_conf):
+                    os.remove(wp_conf)
+
+                proc = await asyncio.create_subprocess_exec(
+                    "wgcf", "generate",
+                    cwd=warp_dir,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=15)
+
+                # Build wireproxy.conf with SOCKS5 section
+                import shutil
+                shutil.copy(profile, wp_conf)
+                with open(wp_conf, "a") as f:
+                    f.write("\n[Socks5]\nBindAddress = 127.0.0.1:1080\n")
+
+                # Start wireproxy
+                proc = await asyncio.create_subprocess_exec(
+                    "wireproxy", "-c", wp_conf,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                # Verify SOCKS5 is listening
+                import socket
+                for _ in range(10):
+                    try:
+                        s = socket.create_connection(("127.0.0.1", 1080), timeout=2)
+                        s.close()
+                        result["message"] = "WARP reconnected via wireproxy (new IP)"
+                        logger.info("✅ %s", result["message"])
+                        return result
+                    except (OSError, ConnectionRefusedError):
+                        await asyncio.sleep(1)
+                result["status"] = "error"
+                result["message"] = "wireproxy started but SOCKS5 not detected on 1080"
+                logger.error("❌ %s", result["message"])
+            except Exception as e:
+                result["status"] = "error"
+                result["message"] = f"WARP reconnect failed: {e}"
+                logger.error("❌ %s", result["message"])
+
+            return result
+
+    async def _stop_warp_proxy(self):
+        for cmd in [["warp-cli", "--accept-tos", "disconnect"]]:
+            try:
+                proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+        _kill_wireproxy()
 
     async def _update_latest_version(self):
         """Periodically checks GitHub for the latest version in the background."""
         while True:
-            await self._refresh_latest_version()
-            # Check every hour in background
+            try:
+                await self._refresh_latest_version()
+            except Exception as e:
+                logger.error("Version check error: %s", e)
             await asyncio.sleep(3600)
 
     async def _refresh_latest_version(self):
         """Checks GitHub config.py for the latest version with cache busting.
         Can be called on-demand (e.g. on page refresh).
+        Uses its own temporary session to avoid resetting the shared session idle timer.
         """
         try:
-            # Use a timestamp to bypass GitHub's cache
             cache_buster = int(time.time())
             url = f"https://raw.githubusercontent.com/realbestia1/EasyProxy/main/config.py?t={cache_buster}"
 
-            # Use a direct session with a short timeout to not block UI too long
-            session = await self._get_session()
-            async with session.get(url, timeout=2) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    # Use regex to find APP_VERSION = "..." or '...'
-                    match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
-                    if match:
-                        new_version = match.group(1)
-                        if self.latest_version != new_version:
-                            self.latest_version = new_version
-                            logger.info(f"🆕 Latest version updated: {self.latest_version}")
+            connector = TCPConnector(limit=1, limit_per_host=1, keepalive_timeout=5)
+            timeout = ClientTimeout(total=5)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(url, timeout=2) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+                        if match:
+                            new_version = match.group(1)
+                            if self.latest_version != new_version:
+                                self.latest_version = new_version
+                                logger.info(f"🆕 Latest version updated: {self.latest_version}")
+                        else:
+                            if self.latest_version == "Checking...":
+                                self.latest_version = "Unknown"
                     else:
                         if self.latest_version == "Checking...":
-                            self.latest_version = "Unknown"
-                else:
-                    if self.latest_version == "Checking...":
-                        self.latest_version = "Error"
+                            self.latest_version = "Error"
         except Exception as e:
             if self.latest_version == "Checking...":
                 self.latest_version = "Unknown"
@@ -429,30 +365,58 @@ class HLSProxyCoreMixin:
     @staticmethod
     def _strip_fake_png_header_from_ts(content: bytes) -> bytes:
         """
-        Some providers prepend a fake 8-byte PNG signature to TS segments.
-        Strip it only when bytes after the header still match TS sync markers.
+        Some providers prepend a fake PNG payload to TS segments.
+        embed.st/strmd.st wraps segments as a minimal valid PNG (IHDR+IDAT+IEND,
+        ~70 bytes) followed by the raw MPEG-TS stream. ExoPlayer scans for the
+        TS sync byte and tolerates this; stricter players (MPV/hls.js used by
+        Stremio PC) do not, and stall forever.
+
+        We locate the first 0x47 sync byte that is followed by another 0x47 at
+        +188 bytes (the TS packet size), then strip everything before it. If no
+        such pattern is found we fall back to the legacy 8-byte PNG signature
+        strip so we don't regress providers that only prepend 8 bytes.
         """
+        if not content:
+            return content
+
+        # Fast path: not a PNG at all -> nothing to do.
         png_sig = b"\x89PNG\r\n\x1a\n"
-        if len(content) <= 8 or not content.startswith(png_sig):
+        if not content.startswith(png_sig):
             return content
 
-        ts_payload = content[8:]
-        # MPEG-TS sync byte is 0x47 at packet boundaries.
-        if not ts_payload or ts_payload[0] != 0x47:
-            return content
-        if len(ts_payload) > 188 and ts_payload[188] != 0x47:
-            return content
+        # Generic path: scan for the first TS sync byte (0x47) that repeats at
+        # +188. Bound the scan so we never iterate over a huge payload.
+        scan_limit = min(4096, len(content) - 188)
+        for i in range(0, scan_limit):
+            if content[i] == 0x47 and content[i + 188] == 0x47:
+                if i <= 8:
+                    return content  # already a clean TS
+                payload = content[i:]
+                # Sanity-check a few more packet boundaries to avoid false positives.
+                if len(payload) > 376 and payload[376] != 0x47:
+                    continue
+                logger.info(
+                    "Removed fake PNG header from TS segment (%d -> %d bytes, header=%d)",
+                    len(content), len(payload), i,
+                )
+                return payload
 
-        logger.info(
-            "Removed fake PNG header from TS segment (%d -> %d bytes)",
-            len(content),
-            len(ts_payload),
-        )
-        return ts_payload
+        # Legacy fallback: strip only the 8-byte PNG signature when the bytes
+        # right after it look like a TS packet.
+        if len(content) > 8:
+            ts_payload = content[8:]
+            if ts_payload and ts_payload[0] == 0x47:
+                if len(ts_payload) <= 188 or ts_payload[188] == 0x47:
+                    logger.info(
+                        "Removed fake PNG header from TS segment (%d -> %d bytes)",
+                        len(content), len(ts_payload),
+                    )
+                    return ts_payload
 
-    @staticmethod
-    def _compute_key_headers(
-        key_url: str, secret_key: str, user_agent: str = None
+        return content
+
+    async def _compute_key_headers(
+        self, key_url: str, secret_key: str, user_agent: str = None
     ) -> tuple[int, int, str, str] | None:
         """
         Compute X-Key-Timestamp, X-Key-Nonce, X-Fingerprint, and X-Key-Path for a /key/ URL.
@@ -490,16 +454,9 @@ class HLSProxyCoreMixin:
             secret_key.encode("utf-8"), resource.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
-        # Proof-of-work loop
-        nonce = 0
-        for i in range(100000):
-            combined = f"{hmac_hash}{resource}{number}{ts}{i}"
-            md5_hash = hashlib.md5(combined.encode("utf-8")).hexdigest()
-            prefix_value = int(md5_hash[:4], 16)
-
-            if prefix_value < 0x1000:  # < 4096
-                nonce = i
-                break
+        # Proof-of-work loop (CPU-bound, run in thread pool to not block event loop)
+        loop = asyncio.get_event_loop()
+        nonce = await loop.run_in_executor(None, HLSProxyCoreMixin._pow_search, hmac_hash, resource, number, ts, 50000)
 
         # Compute fingerprint
         fp_user_agent = (
@@ -525,30 +482,33 @@ class HLSProxyCoreMixin:
 
     async def _get_session(self, prefer_default_family: bool = False, url: str = None):
         if url:
-            self._check_dynamic_warp_bypass(url)
+            await self._check_dynamic_warp_bypass(url)
         target_attr = "flex_session" if prefer_default_family else "session"
         session = getattr(self, target_attr)
         if session is None or session.closed:
             connector_kwargs = {
                 "limit": 0,
                 "limit_per_host": 0,
-                "keepalive_timeout": 60,
+                "keepalive_timeout": 15,
                 "enable_cleanup_closed": True,
+                "use_dns_cache": True,
             }
             if not prefer_default_family:
                 connector_kwargs["family"] = socket.AF_INET
 
             connector = TCPConnector(**connector_kwargs)
             session = aiohttp.ClientSession(
-                timeout=ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None),
+                timeout=ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=30),
                 connector=connector,
             )
             setattr(self, target_attr, session)
+        self._session_atime = time.time()
         return session
 
-    def _check_dynamic_warp_bypass(self, url: str, force: bool = False):
-        """Dynamically adds domain to WARP bypass if it matches known patterns or if forced."""
-        if not ENABLE_WARP or VERSION_MODE != "Full":
+    async def _check_dynamic_warp_bypass(self, url: str):
+        """Dynamically adds domain to WARP bypass if it matches known patterns."""
+        _ENABLE_WARP = _shared.ENABLE_WARP
+        if not _ENABLE_WARP:
             return
 
         try:
@@ -556,102 +516,128 @@ class HLSProxyCoreMixin:
             domain = urlsplit(url).netloc
             if not domain: return
 
-            if is_dynamic_warp_bypass_candidate(domain, force=force):
+            # Sanitize domain: only allow valid hostname characters
+            if not re.match(r'^[a-zA-Z0-9.\-*]+$', domain):
+                return
+
+            if is_dynamic_warp_bypass_candidate(domain):
                 if domain not in BYPASSED_WARP_DOMAINS:
-                    # Always bypass base domain for these providers
                     base_domain = ".".join(domain.split(".")[-2:])
-                    logging.info(f"⚡ [Dynamic Bypass] Adding {base_domain} (and {domain}) to WARP exclusion list...")
+                    logging.info(f"⚠️ [Dynamic Bypass] Adding {base_domain} (and {domain}) to WARP exclusion list...")
 
-                    os.system(f"warp-cli --accept-tos tunnel host add {base_domain} > /dev/null 2>&1")
-                    os.system(f"warp-cli --accept-tos tunnel host add {domain} > /dev/null 2>&1")
+                    proc1 = await asyncio.create_subprocess_exec(
+                        "warp-cli", "--accept-tos", "tunnel", "host", "add", base_domain,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc1.wait()
+                    proc2 = await asyncio.create_subprocess_exec(
+                        "warp-cli", "--accept-tos", "tunnel", "host", "add", domain,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc2.wait()
 
-                    # In Proxy mode, we must also update the local exclusion list
-                    if base_domain not in WARP_EXCLUDE_DOMAINS:
-                        WARP_EXCLUDE_DOMAINS.append(base_domain)
-                    if domain not in WARP_EXCLUDE_DOMAINS:
-                        WARP_EXCLUDE_DOMAINS.append(domain)
+                    _WARP_EXCLUDE_DOMAINS = _shared.WARP_EXCLUDE_DOMAINS
+                    if isinstance(_WARP_EXCLUDE_DOMAINS, list):
+                        if base_domain not in _WARP_EXCLUDE_DOMAINS:
+                            _WARP_EXCLUDE_DOMAINS.append(base_domain)
+                        if domain not in _WARP_EXCLUDE_DOMAINS:
+                            _WARP_EXCLUDE_DOMAINS.append(domain)
 
                     BYPASSED_WARP_DOMAINS.add(domain)
                     BYPASSED_WARP_DOMAINS.add(base_domain)
-                    time.sleep(1.0)
+                    await asyncio.sleep(1.0)
         except Exception as e:
             logging.error(f"❌ Error in dynamic WARP bypass: {e}")
 
     async def _get_proxy_session(self, url: str, bypass_warp: bool = False, forced_proxy: str | None = None):
-        """Get a session with proxy support for the given URL.
-
-        Sessions are cached and reused for the same proxy to improve performance.
+        """Create a fresh session or reuse an existing one for the given URL.
 
         Returns: (session, proxy_url) tuple
-        - session: The aiohttp ClientSession to use
+        - session: The aiohttp ClientSession (wrapped) to use
         - proxy_url: The proxy URL being used, or None for direct connection
         """
-        # Trigger dynamic bypass check before getting proxy settings
-        self._check_dynamic_warp_bypass(url, force=bypass_warp)
+        await self._check_dynamic_warp_bypass(url)
 
-        # ✅ FIX: Decodifica il proxy se è URL-encoded
         if forced_proxy:
             forced_proxy = urllib.parse.unquote(forced_proxy)
+            if forced_proxy.lower() == "off":
+                forced_proxy = None
 
-        proxy = forced_proxy or get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
+        # Stale proxy sessions cleanup (>60s idle, aligned with connector keepalive_timeout)
+        # WARP session is excluded — never closed automatically.
+        if hasattr(self, "_proxy_session_atimes"):
+            now = time.time()
+            _warp_url = _shared.WARP_PROXY_URL
+            stale = [p for p, t in self._proxy_session_atimes.items() if now - t > 60 and p != _warp_url]
+            for p_url in stale:
+                p_sess = self._proxy_sessions.pop(p_url, None)
+                self._proxy_session_atimes.pop(p_url, None)
+                if p_sess and not p_sess.closed:
+                    await p_sess.close()
+
+        proxy = forced_proxy or get_proxy_for_url(url, bypass_warp=bypass_warp)
 
         prefer_default_family = prefer_default_family_for_url(url)
 
         if proxy:
-            # Check if we have a cached session for this proxy
-            if proxy in self.proxy_sessions:
-                cached_session = self.proxy_sessions[proxy]
-                if not cached_session.closed:
-                    # logger.debug(f"♻️ Reusing cached proxy session: {proxy}")
-                    return cached_session, proxy  # Reuse cached session
-                else:
-                    # Remove closed session from cache
-                    del self.proxy_sessions[proxy]
+            if not hasattr(self, "_proxy_sessions"):
+                self._proxy_sessions = {}
+                self._proxy_session_atimes = {}
 
-            # Create new session and cache it
-            logger.info(f"🌍 Creating proxy session: {proxy}")
-            try:
-                # Gestione manuale di socks5h per compatibilità con aiohttp-socks
-                connector_url = proxy
-                rdns = True # Default per SOCKS5
-                if connector_url.startswith("socks5h://"):
-                    connector_url = connector_url.replace("socks5h://", "socks5://")
-                    rdns = True
-                    logger.debug(f"🕵️ SOCKS5h detected: forcing remote DNS resolution")
+            # Evict oldest session if cache gets too large (e.g. >= 10) to prevent memory leak
+            if len(self._proxy_sessions) >= 10 and proxy not in self._proxy_sessions:
+                try:
+                    _warp_url = _shared.WARP_PROXY_URL
+                    candidates = [p for p in self._proxy_sessions if p != _warp_url]
+                    if candidates:
+                        oldest_proxy = min(candidates, key=lambda p: self._proxy_session_atimes.get(p, 0))
+                        oldest_sess = self._proxy_sessions.pop(oldest_proxy, None)
+                        self._proxy_session_atimes.pop(oldest_proxy, None)
+                        if oldest_sess and not oldest_sess.closed:
+                            await oldest_sess.close()
+                            logger.info(f"[NET] Evicted oldest proxy session: {oldest_proxy}")
+                except Exception as e:
+                    logger.warning(f"Failed to evict proxy session: {e}")
 
-                # Unlimited connections for maximum speed
-                connector = ProxyConnector.from_url(
-                    connector_url,
-                    limit=0,  # Unlimited connections
-                    limit_per_host=0,  # Unlimited per host
-                    keepalive_timeout=60,  # Keep connections alive longer
-                    family=socket.AF_INET,  # Force IPv4
-                    rdns=rdns,
-                )
-                timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None)
-                session = ClientSession(timeout=timeout, connector=connector)
-                self.proxy_sessions[proxy] = session  # Cache the session
-                return session, proxy  # Return proxy URL for logging
-            except Exception as e:
-                logger.warning(
-                    f"⚠️ Failed to create proxy connector: {e}, falling back to direct"
-                )
+            if proxy not in self._proxy_sessions or self._proxy_sessions[proxy].closed:
+                logger.info(f"[NET] Creating pooled proxy session: {proxy}")
+                try:
+                    connector = get_connector_for_proxy(
+                        proxy,
+                        limit=0,
+                        limit_per_host=0,
+                        keepalive_timeout=15,
+                        family=socket.AF_INET,
+                    )
+                    timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=30)
+                    session = ClientSession(timeout=timeout, connector=connector)
+                    self._proxy_sessions[proxy] = session
+                except Exception as e:
+                    logger.warning(f"Failed to create proxy connector: {e}")
+                    raise
+            else:
+                session = self._proxy_sessions[proxy]
 
-        # Fallback to shared non-proxy session
+            self._proxy_session_atimes[proxy] = time.time()
+            return SharedSessionWrapper(session), proxy
+
         session = await self._get_session(prefer_default_family=prefer_default_family)
         return session, None
 
     async def _retry_special_cdn_request(self, request_target, headers, disable_ssl: bool):
         """Retry a provider-protected CDN once via an alternate aiohttp route."""
+        _ENABLE_WARP = _shared.ENABLE_WARP
+        _WARP_PROXY_URL = _shared.WARP_PROXY_URL
+        _GLOBAL_PROXIES = _shared.GLOBAL_PROXIES
         retry_proxy = None
-        if ENABLE_WARP and WARP_PROXY_URL and "127.0.0.1" not in WARP_PROXY_URL:
-            retry_proxy = WARP_PROXY_URL
-        elif ENABLE_WARP and WARP_PROXY_URL:
-            from config import is_proxy_alive
-            if is_proxy_alive(WARP_PROXY_URL):
-                retry_proxy = WARP_PROXY_URL
-        elif GLOBAL_PROXIES:
-            retry_proxy = GLOBAL_PROXIES[0]
+        if _ENABLE_WARP and _WARP_PROXY_URL and "127.0.0.1" not in _WARP_PROXY_URL:
+            retry_proxy = _WARP_PROXY_URL
+        elif _ENABLE_WARP and _WARP_PROXY_URL:
+            from config import is_proxy_alive_async
+            if await is_proxy_alive_async(_WARP_PROXY_URL):
+                retry_proxy = _WARP_PROXY_URL
+        elif _GLOBAL_PROXIES:
+            retry_proxy = _GLOBAL_PROXIES[0]
 
         if not retry_proxy:
             return None
@@ -661,7 +647,7 @@ class HLSProxyCoreMixin:
                 retry_proxy,
                 limit=0,
                 limit_per_host=0,
-                keepalive_timeout=60,
+                keepalive_timeout=15,
                 family=socket.AF_INET,
                 rdns=True,
             )
@@ -706,13 +692,74 @@ class HLSProxyCoreMixin:
 
     async def get_extractor(self, url: str, request_headers: dict, host: str = None, bypass_warp: bool = False):
         """Ottiene l'estrattore appropriato per l'URL."""
-        return await resolve_extractor(
+        result = await resolve_extractor(
             self,
             url,
             request_headers,
             host=host,
             bypass_warp=bypass_warp,
         )
+        if result:
+            key = getattr(result, '_cache_key', None) or id(result)
+            for ek, ev in self.extractors.items():
+                if ev is result:
+                    self._extractor_atimes[ek] = time.time()
+                    break
+        return result
+
+    def _extractor_key_for_instance(self, extractor) -> str | None:
+        for key, cached_extractor in self.extractors.items():
+            if cached_extractor is extractor:
+                return key
+        return None
+
+    @staticmethod
+    def _stream_key_for_url(url: str | None) -> str | None:
+        if not url:
+            return None
+        return hashlib.md5(url.encode()).hexdigest()[:12]
+
+    def _touch_extractor_activity(self, extractor_key: str | None = None, stream_key: str | None = None):
+        now = time.time()
+        if extractor_key and extractor_key in self.extractors:
+            self._extractor_atimes[extractor_key] = now
+            if stream_key:
+                self._extractor_stream_atimes[(extractor_key, stream_key)] = now
+            return
+        for key in self.extractors:
+            self._extractor_atimes[key] = now
+            if stream_key:
+                self._extractor_stream_atimes[(key, stream_key)] = now
+
+    def _mark_proxy_dead_if_allowed(self, proxy_url: str | None, dead_duration: int = 300, extractor_key: str | None = None):
+        if not proxy_url:
+            return
+        normalized_key = (extractor_key or "").replace("_direct", "")
+        extractor_proxies = get_extractor_proxies(normalized_key)
+        if len(extractor_proxies) == 1 and urllib.parse.unquote(proxy_url) == urllib.parse.unquote(extractor_proxies[0]):
+            logger.info(
+                "Proxy %s failed for extractor %s, but it is the only configured extractor proxy; keeping it alive.",
+                proxy_url,
+                normalized_key or extractor_key,
+            )
+            return
+        mark_proxy_dead(proxy_url, dead_duration=dead_duration)
+
+    async def _resolve_url_id(self, url_id: str) -> str | None:
+        """Risolve un url_id nell'URL originale (solo U_ base64 short URLs)."""
+        if not url_id:
+            return None
+        # U_ IDs are base64-encoded URLs
+        if url_id.startswith("u_"):
+            try:
+                encoded = url_id[2:]
+                padding = 4 - len(encoded) % 4
+                if padding != 4:
+                    encoded += "=" * padding
+                return base64.urlsafe_b64decode(encoded).decode()
+            except Exception:
+                return None
+        return None
 
     async def cleanup(self):
         """Pulizia delle risorse"""
@@ -722,20 +769,80 @@ class HLSProxyCoreMixin:
             if self.flex_session and not self.flex_session.closed:
                 await self.flex_session.close()
 
-            # Close all cached proxy sessions
-            for proxy_url, session in list(self.proxy_sessions.items()):
-                if session and not session.closed:
-                    await session.close()
-            self.proxy_sessions.clear()
-
-            # Close all cached curl sessions
-            for session in list(self.curl_sessions.values()):
-                if session:
-                    await session.close()
-            self.curl_sessions.clear()
+            if hasattr(self, "_proxy_sessions"):
+                for p_sess in list(self._proxy_sessions.values()):
+                    if not p_sess.closed:
+                        await p_sess.close()
+                self._proxy_sessions.clear()
+                if hasattr(self, "_proxy_session_atimes"):
+                    self._proxy_session_atimes.clear()
 
             for extractor in self.extractors.values():
                 if hasattr(extractor, "close"):
                     await extractor.close()
+            self._extractor_atimes.clear()
+            self._extractor_stream_atimes.clear()
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+
+async def _warp_cli_connect() -> bool:
+    """Standalone WARP warp-cli setup: disconnect, re-register, mode proxy, connect."""
+    import config_store, services.proxy_shared as _shared
+    try:
+        for cmd in [
+            ["warp-cli", "--accept-tos", "disconnect"],
+            ["warp-cli", "--accept-tos", "registration", "delete"],
+            ["warp-cli", "--accept-tos", "registration", "new"],
+        ]:
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            rc = await asyncio.wait_for(proc.wait(), timeout=10)
+            if rc != 0:
+                return False
+        await asyncio.sleep(2)
+        license_key = _shared.WARP_LICENSE_KEY or config_store.get("warp_license_key", "")
+        if license_key:
+            proc = await asyncio.create_subprocess_exec(
+                "warp-cli", "--accept-tos", "registration", "license", license_key,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        for sub_cmd in [["mode", "proxy"], ["proxy", "port", "1080"]]:
+            proc = await asyncio.create_subprocess_exec(
+                "warp-cli", "--accept-tos", *sub_cmd,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        proc = await asyncio.create_subprocess_exec(
+            "warp-cli", "--accept-tos", "connect",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await asyncio.wait_for(proc.wait(), timeout=15)
+        if rc != 0:
+            return False
+        # Verify SOCKS5 is actually listening
+        import socket
+        for _ in range(5):
+            try:
+                s = socket.create_connection(("127.0.0.1", 1080), timeout=2)
+                s.close()
+                return True
+            except (OSError, ConnectionRefusedError):
+                await asyncio.sleep(1)
+        return False
+    except (FileNotFoundError, asyncio.TimeoutError):
+        return False
+
+def _kill_wireproxy():
+    """Kill wireproxy by scanning /proc."""
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/comm") as f:
+                    if "wireproxy" in f.read():
+                        os.kill(int(entry), 9)
+            except (OSError, ProcessLookupError):
+                pass
+    except Exception:
+        pass

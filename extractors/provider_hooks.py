@@ -1,8 +1,6 @@
 import re
 import urllib.parse
 
-from services.manifest_rewriter import ManifestRewriter
-
 
 SPECIAL_CDN_DOMAIN = "cccdn.net"
 SHORT_URL_DOMAINS = ("cinemacity.cc", SPECIAL_CDN_DOMAIN)
@@ -12,13 +10,11 @@ DYNAMIC_WARP_BYPASS_DOMAINS = (
     "strem.fun",
     "torrentio.strem.fun",
 )
-PROTECTED_CURL_DOMAINS = ("cinemacity.cc", "torrentio", "strem.fun")
+PROTECTED_CURL_DOMAINS = ("cinemacity.cc", "torrentio", "strem.fun", "strmd.st")
 MANIFEST_ONLY_CURL_DOMAINS = ("torrentio", "strem.fun")
 BROWSER_ACTIVITY_KEYS = (
     "dlstreams",
     "dlstreams_direct",
-    "embedsports",
-    "embedsports_direct",
 )
 
 
@@ -29,7 +25,9 @@ def hls_url_ttl_for(url: str, default_ttl: int, extended_ttl: int) -> int:
 
 def is_dynamic_warp_bypass_candidate(domain: str, force: bool = False) -> bool:
     value = (domain or "").lower()
-    return force or any(pattern in value for pattern in DYNAMIC_WARP_BYPASS_DOMAINS)
+    if force:
+        return False
+    return any(pattern in value for pattern in DYNAMIC_WARP_BYPASS_DOMAINS)
 
 
 def prefer_default_family_for_url(url: str) -> bool:
@@ -121,13 +119,6 @@ def should_use_short_captured_manifest_urls(original_url: str, host_param: str) 
     )
 
 
-def requires_captured_manifest_proxy(host_param: str | None, original_url: str, stream_url: str) -> bool:
-    host = (host_param or "").lower()
-    original = (original_url or "").lower()
-    stream = (stream_url or "").lower()
-    return host == "vidxgo" or "vidxgo" in original or "vidxgo" in stream
-
-
 def is_expired_embed_error(error_msg: str) -> bool:
     value = (error_msg or "").lower()
     return "expired vixsrc embed url" in value or (
@@ -169,51 +160,7 @@ async def fetch_browser_backed_key(extractors: dict, key_url: str, original_chan
     return None
 
 
-async def recover_forbidden_manifest(proxy, request, stream_url: str, headers: dict, bypass_warp: bool, forced_proxy: str | None):
-    match = re.search(r"/premium(\d+)/", stream_url or "")
-    referer = headers.get("Referer") or headers.get("referer") or ""
-    if not (match and "dlhd" in referer.lower()):
-        return None
 
-    referer_parts = urllib.parse.urlparse(referer)
-    referer_origin = f"{referer_parts.scheme}://{referer_parts.netloc}"
-    channel_url = f"{referer_origin}/watch.php?id={match.group(1)}"
-    extractor = await proxy.get_extractor(
-        channel_url,
-        headers,
-        host="dlstreams",
-        bypass_warp=bypass_warp,
-    )
-    refreshed = await extractor.extract(
-        channel_url,
-        force_refresh=True,
-        request_headers=headers,
-        bypass_warp=bypass_warp,
-    )
-    captured_manifest = refreshed.get("captured_manifest")
-    refreshed_url = refreshed.get("destination_url")
-    if not (captured_manifest and refreshed_url):
-        return None
-
-    scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-    host = request.headers.get("X-Forwarded-Host", request.host)
-    proxy_base = f"{scheme}://{host}"
-    return await ManifestRewriter.rewrite_manifest_urls(
-        manifest_content=captured_manifest,
-        base_url=refreshed_url,
-        proxy_base=proxy_base,
-        stream_headers=refreshed.get("request_headers", headers),
-        original_channel_url=channel_url,
-        api_password=request.query.get("api_password"),
-        get_extractor_func=lambda url, hdrs, host=None: proxy.get_extractor(
-            url, hdrs, host, bypass_warp=bypass_warp
-        ),
-        no_bypass=request.query.get("no_bypass") == "1",
-        shorten_url_func=None,
-        bypass_warp=bypass_warp,
-        disable_ssl=request.query.get("disable_ssl") == "1",
-        selected_proxy=forced_proxy,
-    )
 
 
 __all__ = [
@@ -227,10 +174,8 @@ __all__ = [
     "final_curl_request_url",
     "should_use_short_manifest_urls",
     "should_use_short_captured_manifest_urls",
-    "requires_captured_manifest_proxy",
     "is_expired_embed_error",
     "extractor_name_for_log",
     "is_browser_key_request",
     "fetch_browser_backed_key",
-    "recover_forbidden_manifest",
 ]

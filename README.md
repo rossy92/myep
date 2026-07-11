@@ -12,25 +12,23 @@ A powerful, lightweight proxy server designed to handle HLS, M3U8, and DASH (MPD
 ## ✨ Features
 
 - **🌐 Universal Proxy**: Seamlessly handles HLS, M3U8, MPD (DASH), and static video files.
-- **🔓 DRM Support**: ClearKey decryption via FFmpeg transcoding or legacy mode.
-- **🔐 Specialized Extractors**: Native support for Vavoo, DaddyliveHD, Sportsonline, VixSrc, DoodStream, MaxStream, and more.
+- **🔓 DRM Support**: ClearKey decryption via legacy mode.
+- **🔐 Specialized Extractors**: Native support for Vavoo, DaddyliveHD, Sportsonline, VixSrc, DoodStream, EmbedSports, and more.
 - **📼 Integrated DVR**: Record live streams while watching or schedule background recordings.
 - **🛠️ Playlist Builder**: Web interface to combine, manage, and proxy entire M3U playlists.
 - **☁️ Cloud Ready**: Optimized for HuggingFace, Render, Koyeb, and other free-tier platforms.
-- **🛡️ Cloudflare Bypass**: Integrated with FlareSolverr for bot protection bypass.
 
 ---
 
 ## 🚀 Quick Start
 
 ### 🐳 Docker (Recommended)
-The Docker image includes EasyProxy plus integrated FlareSolverr for maximum compatibility.
+The Docker image includes EasyProxy plus integrated CF Turnstile Solver for maximum compatibility. 
+
+To run the container and persist config/recordings on your host machine, mount the `/data` directory:
 
 ```bash
-docker run -d -p 7860:7860 --name EasyProxy ghcr.io/realbestia1/easyproxy:latest
-
-# With Cloudflare WARP (Bypass IP blocks)
-docker run -d --name EasyProxy --cap-add=NET_ADMIN --device /dev/net/tun -e ENABLE_WARP=true -p 7860:7860 ghcr.io/realbestia1/easyproxy:latest
+docker run -d -p 7860:7860 -v ./data:/data --name EasyProxy ghcr.io/realbestia1/easyproxy:latest
 ```
 
 ### 🐍 Python (Local)
@@ -38,13 +36,12 @@ docker run -d --name EasyProxy --cap-add=NET_ADMIN --device /dev/net/tun -e ENAB
 #### Prerequisites (All Platforms)
 - **Python 3.11+**
 - **Git** (for cloning dependencies)
-- **FFmpeg** (for stream recording/remuxing)
 
 #### 🪟 Windows Setup
 The easiest way to get EasyProxy plus solvers on Windows:
 1. Clone the repository and enter the folder.
 2. Run **`start_full.bat`**.
-*This script automatically handles FlareSolverr, patches, and dependencies.*
+*This script automatically handles CF Turnstile Solver, patches, and dependencies.*
 
 #### 🐧 Linux / macOS Setup
 1. **Install dependencies**:
@@ -87,48 +84,25 @@ For Termux, full functionality requires a 64-bit Android device. On 32-bit devic
 | **Docker** | Standard `docker build .` uses the single `Dockerfile` with solvers included. |
 | **Docker Compose** | Run the complete stack (Proxy + Solvers) with `docker-compose up -d`. |
 | **HuggingFace** | Use `Dockerfile-hf` for seamless deployment on HF Spaces. |
-| **Termux** | Support for Android via Python & FFmpeg. |
+| **Termux** | Support for Android via Python. |
 
 ---
 
 ## ⚙️ Configuration
 
-Configure the server via a `.env` file. See `.env.example` for all options.
+Most configuration settings (including Cloudflare WARP, DVR, and Proxy settings) are now managed directly from the **Admin Panel** at `http://localhost:7860/admin`.
+
+Only basic environment variables need to be set in your `.env` file or container settings:
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `PORT` | Server port | `7860` |
-| `API_PASSWORD` | Optional password for API endpoints | `ep` |
-| `DVR_ENABLED` | Enable recording features | `false` |
-| `ENABLE_WARP` | Enable integrated Cloudflare WARP | `false` |
-| `WARP_EXCLUDED_HOSTS` | Comma-separated hosts that must bypass the WARP VPN tunnel and use the server real IP | built-in defaults |
-| `WARP_LICENSE_KEY` | Optional WARP+ license key | - |
+| `API_PASSWORD` | Password to protect the proxy API and admin panel | `ep` |
 
 ### 🛡️ Cloudflare WARP Integration
-The Docker image includes an integrated Cloudflare WARP client to bypass IP-based blocks. When enabled, outgoing traffic used by FlareSolverr and EasyProxy can be routed through the Cloudflare network.
+The Docker image includes an integrated Cloudflare WARP client to bypass IP-based blocks.
 
-**Requirements:**
-To function correctly, the container needs elevated network permissions:
-- **Docker Compose:** Handled automatically in the provided `docker-compose.yml`.
-- **Docker Run:** You must add `--cap-add=NET_ADMIN --device /dev/net/tun`.
-- **Coolify (Git Repository / Dockerfile):**
-  1. Go to your application **Settings** -> **General**.
-  2. In the **Custom Docker Options** field, paste:
-     `--cap-add NET_ADMIN --device /dev/net/tun:/dev/net/tun`
-  3. Click **Save** and **Redeploy**.
-
-**Example command (Docker Run):**
-```bash
-docker run -d --name easyproxy --cap-add=NET_ADMIN --device /dev/net/tun -e ENABLE_WARP=true -p 7860:7860 ghcr.io/realbestia1/easyproxy:latest
-```
-
-For restricted Docker environments that cannot expose `/dev/net/tun`, build the image and run with `-e ENABLE_WARP=true -e WARP_MODE=wireproxy`.
-
-> [!IMPORTANT]
-> If a provider has issues behind WARP, configure the host in `WARP_EXCLUDED_HOSTS`.
-> With WARP running as a VPN tunnel, bypass must be configured through the `WARP_EXCLUDED_HOSTS` environment variable so the host exits with the server real IP.
-> Example:
-> `WARP_EXCLUDED_HOSTS=cinemacity.cc,cccdn.net,strem.fun,torrentio.strem.fun,problem-host.example`
+You can enable and configure WARP, customize the excluded domains list, and enter your license key directly from the **Admin Panel**.
 
 ---
 

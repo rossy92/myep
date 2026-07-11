@@ -2,8 +2,12 @@ import json
 import logging
 import os
 from aiohttp import web
+import functools
+import shutil
 
-from config import check_password
+import config
+from config import check_password, APP_VERSION
+import config_store
 
 logger = logging.getLogger(__name__)
 
@@ -11,15 +15,35 @@ logger = logging.getLogger(__name__)
 def setup_recording_routes(app, recording_manager):
     """Setup all recording-related routes."""
 
+    def dvr_required(handler):
+        @functools.wraps(handler)
+        async def wrapper(*args, **kwargs):
+            if not config_store.get("dvr_enabled", False):
+                return web.json_response({"error": "DVR is disabled"}, status=404)
+            return await handler(*args, **kwargs)
+        return wrapper
+
     async def handle_recordings_page(request):
         """Serve the recordings UI page."""
+        if not check_password(request):
+            raise web.HTTPFound('/admin/login')
         template_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'templates', 'recordings.html'
         )
         try:
             with open(template_path, 'r', encoding='utf-8') as f:
-                return web.Response(text=f.read(), content_type='text/html')
+                html_content = f.read()
+            proxy = app.get('proxy')
+            latest_version = getattr(proxy, 'latest_version', 'Unknown') if proxy else 'Unknown'
+            warp_status = getattr(proxy, 'warp_status', 'Unknown') if proxy else 'Unknown'
+            is_outdated = latest_version not in ["Checking...", "Unknown", "Error", APP_VERSION]
+            version_status_class = "outdated" if is_outdated else ""
+            html_content = html_content.replace("{{APP_VERSION}}", APP_VERSION)
+            html_content = html_content.replace("{{LATEST_VERSION}}", latest_version)
+            html_content = html_content.replace("{{VERSION_STATUS_CLASS}}", version_status_class)
+            html_content = html_content.replace("{{WARP_STATUS}}", warp_status)
+            return web.Response(text=html_content, content_type='text/html')
         except FileNotFoundError:
             return web.Response(text="Recordings template not found",
                                status=404)
@@ -31,10 +55,12 @@ def setup_recording_routes(app, recording_manager):
 
         status = request.query.get('status')
         recordings = recording_manager.get_all_recordings(status=status)
+        system_stats = config.get_system_stats()
 
         return web.json_response({
             "recordings": recordings,
-            "active_count": len([r for r in recordings if r.get('is_active')])
+            "active_count": len([r for r in recordings if r.get('is_active')]),
+            "system_stats": system_stats
         })
 
     async def handle_get_recording(request):
@@ -67,6 +93,21 @@ def setup_recording_routes(app, recording_manager):
 
         name = data.get('name')
         duration = data.get('duration')
+        warp = data.get('warp')
+        proxy = data.get('proxy')
+        disable_ssl = data.get('disable_ssl')
+
+        # Append configuration parameters as query params to the URL
+        from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+        parsed = urlparse(url)
+        qsl = parse_qsl(parsed.query)
+        if warp == 'off':
+            qsl.append(('warp', 'off'))
+        if proxy == 'off':
+            qsl.append(('proxy', 'off'))
+        if disable_ssl == '1':
+            qsl.append(('disable_ssl', '1'))
+        url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(qsl), parsed.fragment))
 
         if duration:
             try:
@@ -181,7 +222,7 @@ def setup_recording_routes(app, recording_manager):
         filename = os.path.basename(file_path)
 
         # Determine content type based on extension
-        content_type = "video/MP2T"
+        content_type = "video/mp2t"
         if filename.endswith('.mp4'):
             content_type = "video/mp4"
         elif filename.endswith('.mkv'):
@@ -226,7 +267,7 @@ def setup_recording_routes(app, recording_manager):
             return web.json_response({"error": "Access denied"}, status=403)
 
         # Determine content type based on extension
-        content_type = "video/MP2T"
+        content_type = "video/mp2t"
         if file_path.endswith('.mp4'):
             content_type = "video/mp4"
         elif file_path.endswith('.mkv'):
@@ -268,7 +309,7 @@ def setup_recording_routes(app, recording_manager):
                         if not rec or not rec.get('is_active'):
                             logger.debug(f"Recording {recording_id} finished, ending stream")
                             break
-                        # Wait for more data from FFmpeg
+                        # Wait for more data from recording process
                         await asyncio.sleep(0.5)
         except ConnectionResetError:
             logger.debug(f"Client disconnected from recording {recording_id} stream")
@@ -419,18 +460,18 @@ def setup_recording_routes(app, recording_manager):
         raise web.HTTPFound(stream_url)
 
     # Register routes
-    app.router.add_get('/recordings', handle_recordings_page)
-    app.router.add_get('/record', handle_record_via_get)  # GET endpoint for StreamVix
-    app.router.add_get('/record/stop/{id}', handle_stop_and_stream)  # Stop recording and stream
-    app.router.add_get('/api/recordings', handle_list_recordings)
-    app.router.add_get('/api/recordings/active', handle_active_recordings)
-    app.router.add_post('/api/recordings/start', handle_start_recording)
-    app.router.add_delete('/api/recordings/all', handle_delete_all_recordings)
-    app.router.add_get('/api/recordings/{id}', handle_get_recording)
-    app.router.add_post('/api/recordings/{id}/stop', handle_stop_recording)
-    app.router.add_delete('/api/recordings/{id}', handle_delete_recording)
-    app.router.add_get('/api/recordings/{id}/delete', handle_delete_recording_get)
-    app.router.add_get('/api/recordings/{id}/download', handle_download_recording)
-    app.router.add_get('/api/recordings/{id}/stream', handle_stream_recording)
+    app.router.add_get('/recordings', dvr_required(handle_recordings_page))
+    app.router.add_get('/record', dvr_required(handle_record_via_get))  # GET endpoint for StreamVix
+    app.router.add_get('/record/stop/{id}', dvr_required(handle_stop_and_stream))  # Stop recording and stream
+    app.router.add_get('/api/recordings', dvr_required(handle_list_recordings))
+    app.router.add_get('/api/recordings/active', dvr_required(handle_active_recordings))
+    app.router.add_post('/api/recordings/start', dvr_required(handle_start_recording))
+    app.router.add_delete('/api/recordings/all', dvr_required(handle_delete_all_recordings))
+    app.router.add_get('/api/recordings/{id}', dvr_required(handle_get_recording))
+    app.router.add_post('/api/recordings/{id}/stop', dvr_required(handle_stop_recording))
+    app.router.add_delete('/api/recordings/{id}', dvr_required(handle_delete_recording))
+    app.router.add_get('/api/recordings/{id}/delete', dvr_required(handle_delete_recording_get))
+    app.router.add_get('/api/recordings/{id}/download', dvr_required(handle_download_recording))
+    app.router.add_get('/api/recordings/{id}/stream', dvr_required(handle_stream_recording))
 
     logger.debug("Recording routes registered")

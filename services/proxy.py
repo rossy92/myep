@@ -1,9 +1,17 @@
-from services.proxy_shared import ENABLE_WARP, PlaylistBuilder, logger
+from services.proxy_shared import PlaylistBuilder, logger
+import asyncio
+import os
+import contextvars
 from services.proxy_core import HLSProxyCoreMixin
 from services.proxy_dash import HLSProxyDashMixin
 from services.proxy_handlers import HLSProxyHandlersMixin
 from services.proxy_pages import HLSProxyPagesMixin
 from services.proxy_streaming import HLSProxyStreamingMixin
+
+# ContextVars to isolate extractor state per request/asyncio task to avoid concurrent request interference
+_extractors_var = contextvars.ContextVar("extractors", default=None)
+_extractor_atimes_var = contextvars.ContextVar("extractor_atimes", default=None)
+_extractor_stream_atimes_var = contextvars.ContextVar("extractor_stream_atimes", default=None)
 
 
 class HLSProxy(
@@ -15,9 +23,45 @@ class HLSProxy(
 ):
     """Proxy HLS per stream, playlist, DASH e segmenti."""
 
-    def __init__(self, ffmpeg_manager=None):
-        self.extractors = {}
-        self.ffmpeg_manager = ffmpeg_manager
+    @property
+    def extractors(self):
+        val = _extractors_var.get()
+        if val is None:
+            val = {}
+            _extractors_var.set(val)
+        return val
+
+    @extractors.setter
+    def extractors(self, value):
+        _extractors_var.set(value)
+
+    @property
+    def _extractor_atimes(self):
+        val = _extractor_atimes_var.get()
+        if val is None:
+            val = {}
+            _extractor_atimes_var.set(val)
+        return val
+
+    @_extractor_atimes.setter
+    def _extractor_atimes(self, value):
+        _extractor_atimes_var.set(value)
+
+    @property
+    def _extractor_stream_atimes(self):
+        val = _extractor_stream_atimes_var.get()
+        if val is None:
+            val = {}
+            _extractor_stream_atimes_var.set(val)
+        return val
+
+    @_extractor_stream_atimes.setter
+    def _extractor_stream_atimes(self, value):
+        _extractor_stream_atimes_var.set(value)
+
+    def __init__(self):
+        # Note: self.extractors, self._extractor_atimes, and self._extractor_stream_atimes 
+        # are lazily initialized per asyncio task context to prevent concurrent request race conditions.
 
         # Inizializza il playlist_builder se il modulo è disponibile
         if PlaylistBuilder:
@@ -26,44 +70,30 @@ class HLSProxy(
         else:
             self.playlist_builder = None
 
-        # Cache per segmenti di inizializzazione (URL -> content)
-        self.init_cache = {}
-
-        # Cache per segmenti decriptati (URL -> (content, timestamp))
-        self.segment_cache = {}
-        self.segment_cache_ttl = 30  # Seconds
-
-        # Prefetch queue for background downloading
+        # Prefetch queue for background downloading (kept for prefetch logic, no segment cache storage)
         self.prefetch_tasks = set()
+        self._prefetch_semaphore = asyncio.Semaphore(5)
+        self._prefetch_lock = asyncio.Lock()
 
         # Sessione condivisa per il proxy (no proxy)
         self.session = None
         self.flex_session = None
 
-        # Registry for HLS URL shortening (to handle extremely long multi-path URLs)
-        # url_id -> (actual_url, timestamp, ttl)
-        self.hls_url_map = {}
-        self.hls_url_ttl = 3600
-        self.hls_url_extended_ttl = 10800
-        self.hls_url_max_entries = 2000
-        self.captured_hls_manifest_map = {}
-        self.captured_hls_refresh_tasks = {}
-        self.captured_hls_segment_counts = {}
-        self.captured_hls_segment_refresh_tasks = {}
+        # Proxy sessions are created fresh per request — no caching
 
-        # Cache for proxy sessions (proxy_url -> session)
-        # This reuses connections for the same proxy to improve performance
-        self.proxy_sessions = {}
-        self.curl_sessions = {}  # Registry for pooled curl_cffi sessions
+        # Refreshed CDN tokens for live token substitution after re-extract on 403.
+        # stream_key -> (old_base_dir, new_base_dir, new_query_string_with_leading_question_mark)
+        self._renewed_cdn_tokens: dict[str, tuple[str, str, str]] = {}
+        self._renewed_cdn_token_atimes: dict[str, float] = {}
+
+        # Template cache (read once, serve many)
+        self._template_cache = {}
+        self._template_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates")
 
         # Version information
         self.latest_version = "Checking..."
-        self.warp_status = "Checking..." if ENABLE_WARP else "Disabled"
-
-        # Registry for DASH native sessions (to handle segment proxying without HLS conversion)
-        # session_id -> (base_url, headers, clearkey, timestamp)
-        self.dash_sessions = {}
-        self.dash_session_ttl = 21600  # 6 hours
+        self.warp_status = "Checking..."
+        self._warp_ip = ""
 
 
 

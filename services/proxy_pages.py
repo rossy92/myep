@@ -1,4 +1,24 @@
-from services.proxy_shared import *
+import os
+import json
+import time
+import asyncio
+import shutil
+import urllib.parse
+import urllib.request
+import platform
+import tarfile
+import zipfile
+import tempfile
+import services.proxy_shared as _shared
+from services.proxy_shared import (
+    logger, web, APP_VERSION,
+    check_password, get_client_ip, PlaylistBuilder, ClientSession, ClientTimeout,
+    TCPConnector, ProxyConnector, get_connector_for_proxy, API_PASSWORD,
+)
+from extractors.registry import *
+import config_store
+import config as _config
+from config import reload_config, clear_proxy_affinity, get_system_stats
 
 class HLSProxyPagesMixin:
 
@@ -59,18 +79,28 @@ class HLSProxyPagesMixin:
             await response.write_eof()
             return response
 
+        except (ConnectionResetError, OSError) as e:
+            logger.info(f"Playlist download interrupted (client disconnected): {e}")
+            return web.Response(status=200)
+        except RuntimeError as e:
+            if "closing transport" in str(e).lower() or "closed response" in str(e).lower():
+                logger.info("Playlist download interrupted (closing transport)")
+                return web.Response(status=200)
+            logger.error(f"General error in playlist handler: {str(e)}")
+            return web.Response(text=f"Error: {str(e)}", status=500)
         except Exception as e:
             logger.error(f"General error in playlist handler: {str(e)}")
             return web.Response(text=f"Error: {str(e)}", status=500)
 
     def _read_template(self, filename: str) -> str:
-        """Funzione helper per leggere un file di template."""
-        # Nota: assume che i template siano nella directory 'templates' nella root del progetto
-        # Poiché siamo in services/, dobbiamo salire di un livello
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        template_path = os.path.join(base_dir, "templates", filename)
+        """Funzione helper per leggere un file di template con caching."""
+        if filename in self._template_cache:
+            return self._template_cache[filename]
+        template_path = os.path.join(self._template_cache_dir, filename)
         with open(template_path, "r", encoding="utf-8") as f:
-            return f.read()
+            content = f.read()
+        self._template_cache[filename] = content
+        return content
 
     async def handle_root(self, request):
         """Serve la pagina principale index.html."""
@@ -84,10 +114,10 @@ class HLSProxyPagesMixin:
             is_outdated = self.latest_version not in ["Checking...", "Unknown", "Error", APP_VERSION]
             version_status_class = "outdated" if is_outdated else ""
 
-            html_content = html_content.replace("{{VERSION_MODE}}", VERSION_MODE)
             html_content = html_content.replace("{{APP_VERSION}}", APP_VERSION)
             html_content = html_content.replace("{{LATEST_VERSION}}", self.latest_version)
             html_content = html_content.replace("{{VERSION_STATUS_CLASS}}", version_status_class)
+            self.warp_status = await self.get_warp_status()
             html_content = html_content.replace("{{WARP_STATUS}}", self.warp_status)
             return web.Response(text=html_content, content_type="text/html")
         except Exception as e:
@@ -128,6 +158,13 @@ class HLSProxyPagesMixin:
         """Serve la pagina web per generare URL proxy ed extractor."""
         try:
             html_content = self._read_template("url_generator.html")
+            is_outdated = self.latest_version not in ["Checking...", "Unknown", "Error", APP_VERSION]
+            version_status_class = "outdated" if is_outdated else ""
+            html_content = html_content.replace("{{APP_VERSION}}", APP_VERSION)
+            html_content = html_content.replace("{{LATEST_VERSION}}", self.latest_version)
+            html_content = html_content.replace("{{VERSION_STATUS_CLASS}}", version_status_class)
+            self.warp_status = await self.get_warp_status()
+            html_content = html_content.replace("{{WARP_STATUS}}", self.warp_status)
             return web.Response(text=html_content, content_type="text/html")
         except Exception as e:
             logger.error(f"Unable to load 'url_generator.html': {e}")
@@ -141,6 +178,13 @@ class HLSProxyPagesMixin:
         """Gestisce l'interfaccia web del playlist builder."""
         try:
             html_content = self._read_template("builder.html")
+            is_outdated = self.latest_version not in ["Checking...", "Unknown", "Error", APP_VERSION]
+            version_status_class = "outdated" if is_outdated else ""
+            html_content = html_content.replace("{{APP_VERSION}}", APP_VERSION)
+            html_content = html_content.replace("{{LATEST_VERSION}}", self.latest_version)
+            html_content = html_content.replace("{{VERSION_STATUS_CLASS}}", version_status_class)
+            self.warp_status = await self.get_warp_status()
+            html_content = html_content.replace("{{WARP_STATUS}}", self.warp_status)
             return web.Response(text=html_content, content_type="text/html")
         except Exception as e:
             logger.error(f"❌ Critical error: unable to load 'builder.html': {e}")
@@ -162,10 +206,10 @@ class HLSProxyPagesMixin:
             is_outdated = self.latest_version not in ["Checking...", "Unknown", "Error", APP_VERSION]
             version_status_class = "outdated" if is_outdated else ""
 
-            html_content = html_content.replace("{{VERSION_MODE}}", VERSION_MODE)
             html_content = html_content.replace("{{APP_VERSION}}", APP_VERSION)
             html_content = html_content.replace("{{LATEST_VERSION}}", self.latest_version)
             html_content = html_content.replace("{{VERSION_STATUS_CLASS}}", version_status_class)
+            self.warp_status = await self.get_warp_status()
             html_content = html_content.replace("{{WARP_STATUS}}", self.warp_status)
             return web.Response(text=html_content, content_type="text/html")
         except Exception as e:
@@ -199,10 +243,12 @@ class HLSProxyPagesMixin:
         # Refresh version on API call
         await self._refresh_latest_version()
 
+        stats = get_system_stats()
+
         info = {
-            "proxy": "HLS Proxy Server",
+            "proxy": "EasyProxy",
             "version": APP_VERSION,  # Aggiornata per supporto AES-128
-            "mode": VERSION_MODE,
+
             "status": "✅ Running",
             "features": [
                 "✅ Proxy HLS streams",
@@ -213,6 +259,25 @@ class HLSProxyPagesMixin:
                 "✅ CORS enabled",
             ],
             "extractors_loaded": list(self.extractors.keys()),
+            "diagnostics": {
+                "extractors_cached": len(self.extractors),
+                "cdn_tokens": len(getattr(self, '_renewed_cdn_tokens', {})),
+                "proxy_sessions_cached": len(getattr(self, '_proxy_sessions', {})),
+                "active_stream_sessions": len(_shared.ACTIVE_STREAM_SESSIONS),
+                "bypassed_warp_domains": len(_shared.BYPASSED_WARP_DOMAINS),
+                "template_cache": len(getattr(self, '_template_cache', {})),
+                "dead_proxies": len(getattr(_config, 'DEAD_PROXIES', {})),
+                "shared_session_active": bool(self.session and not self.session.closed),
+                "flex_session_active": bool(getattr(self, 'flex_session', None) and not self.flex_session.closed),
+                "session_idle_seconds": round(time.time() - getattr(self, '_session_atime', 0), 1) if getattr(self, '_session_atime', 0) else None,
+                "connection_count": sum(len(v) for v in self.session._connector._conns.values()) if self.session and not self.session.closed and hasattr(self.session, '_connector') and hasattr(self.session._connector, '_conns') else 0,
+                "proxy_connection_count": sum(
+                    sum(len(v) for v in s._connector._conns.values())
+                    for s in getattr(self, '_proxy_sessions', {}).values()
+                    if s and not s.closed and hasattr(s, '_connector') and hasattr(s._connector, '_conns')
+                ),
+            },
+            "memory": stats.get("proxy_ram", {}),
             "modules": {
                 "playlist_builder": PlaylistBuilder is not None,
                 "vavoo_extractor": VavooExtractor is not None,
@@ -223,11 +288,11 @@ class HLSProxyPagesMixin:
                 "streamtape_extractor": StreamtapeExtractor is not None,
             },
             "proxy_config": {
-                "global_proxies": f"{len(GLOBAL_PROXIES)} proxies loaded",
-                "transport_routes": f"{len(TRANSPORT_ROUTES)} routing rules configured",
+                "global_proxies": f"{len(_shared.GLOBAL_PROXIES)} proxies loaded",
+                "transport_routes": f"{len(_shared.TRANSPORT_ROUTES)} routing rules configured",
                 "routes": [
                     {"url": route["url"], "has_proxy": route["proxy"] is not None}
-                    for route in TRANSPORT_ROUTES
+                    for route in _shared.TRANSPORT_ROUTES
                 ],
             },
             "endpoints": {
@@ -267,20 +332,26 @@ class HLSProxyPagesMixin:
         }
         security = [{"ApiPasswordQuery": []}] if requires_password else []
 
+        version = APP_VERSION
+
         spec = {
             "openapi": "3.0.3",
             "info": {
                 "title": "EasyProxy API",
-                "version": "2.5.0",
+                "version": version,
                 "description": (
                     "Interactive documentation for EasyProxy. "
                     "Includes HLS/MPD proxying, extractor endpoints, key and license helpers, "
-                    "playlist generation, and compatibility endpoints inspired by MediaFlow Proxy."
+                    "playlist generation, admin API, DVR/recording management, "
+                    "and compatibility endpoints inspired by MediaFlow Proxy."
                 ),
             },
             "servers": [{"url": server_url}],
             "components": {"securitySchemes": security_schemes},
             "paths": {
+
+                # --- System & Public ---
+
                 "/api/info": {
                     "get": {
                         "summary": "Server information",
@@ -288,6 +359,46 @@ class HLSProxyPagesMixin:
                         "responses": {"200": {"description": "Server information JSON"}},
                     }
                 },
+                "/health": {
+                    "get": {
+                        "summary": "Health check",
+                        "description": "Simple health check endpoint returning OK status and app version.",
+                        "responses": {"200": {"description": "JSON with status and version"}},
+                    }
+                },
+                "/generate_urls": {
+                    "post": {
+                        "summary": "Generate proxy URLs",
+                        "description": "Generate one or multiple compatibility URLs for clients.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "mediaflow_proxy_url": {"type": "string"},
+                                            "api_password": {"type": "string"},
+                                            "urls": {"type": "array", "items": {"type": "object"}},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "responses": {"200": {"description": "Generated URL list"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/proxy/ip": {
+                    "get": {
+                        "summary": "Resolve public IP",
+                        "description": "Returns the public IP as seen through the configured proxy route.",
+                        "responses": {"200": {"description": "Public IP response"}},
+                    }
+                },
+
+                # --- Proxy & Streaming ---
+
                 "/proxy/manifest.m3u8": {
                     "get": {
                         "summary": "Legacy proxy manifest",
@@ -312,6 +423,16 @@ class HLSProxyPagesMixin:
                         **({"security": security} if requires_password else {}),
                     }
                 },
+                "/proxy/hls/segment.{format}": {
+                    "get": {
+                        "summary": "HLS segment compatibility",
+                        "description": "Serve HLS segments (ts, m4s, mp4, vtt) through the proxy with proper headers.",
+                        "parameters": [
+                            {"name": "format", "in": "path", "schema": {"type": "string", "enum": ["ts", "m4s", "mp4", "vtt"]}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Segment data"}},
+                    }
+                },
                 "/proxy/mpd/manifest.m3u8": {
                     "get": {
                         "summary": "Proxy MPD as HLS",
@@ -326,6 +447,29 @@ class HLSProxyPagesMixin:
                         **({"security": security} if requires_password else {}),
                     }
                 },
+                "/proxy/mpd/manifest.mpd": {
+                    "get": {
+                        "summary": "Proxy MPD native",
+                        "description": "Proxy the native MPD manifest for DASH streams.",
+                        "parameters": [
+                            {"name": "d", "in": "query", "schema": {"type": "string"}, "required": True, "description": "Destination MPD URL"},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Proxied MPD manifest"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/proxy/mpd/segment/{session_id}/{tail:.*}": {
+                    "get": {
+                        "summary": "DASH segment serving",
+                        "description": "Serve DASH segments for an active MPD-to-HLS conversion session.",
+                        "parameters": [
+                            {"name": "session_id", "in": "path", "schema": {"type": "string"}, "required": True},
+                            {"name": "tail", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Segment data"}},
+                    }
+                },
                 "/proxy/stream": {
                     "get": {
                         "summary": "Generic stream proxy",
@@ -338,6 +482,42 @@ class HLSProxyPagesMixin:
                         **({"security": security} if requires_password else {}),
                     }
                 },
+                "/playlist": {
+                    "get": {
+                        "summary": "Build a playlist",
+                        "description": "Combine multiple source URLs into a generated playlist.",
+                        "parameters": [
+                            {"name": "url", "in": "query", "schema": {"type": "string"}, "required": True},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Generated playlist"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/segment/{segment}": {
+                    "get": {
+                        "summary": "Legacy TS segment serving",
+                        "description": "Serve TS segments by their segment identifier.",
+                        "parameters": [
+                            {"name": "segment", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Segment data"}},
+                    }
+                },
+                "/decrypt/segment.{format}": {
+                    "get": {
+                        "summary": "Legacy decrypt segment",
+                        "description": "Decrypt and serve segments using ClearKey (legacy mode).",
+                        "parameters": [
+                            {"name": "format", "in": "path", "schema": {"type": "string", "enum": ["mp4", "ts"]}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Decrypted segment"}},
+                    }
+                },
+
+
+                # --- Extractors ---
+
                 "/extractor": {
                     "get": {
                         "summary": "Generic extractor",
@@ -364,24 +544,12 @@ class HLSProxyPagesMixin:
                         **({"security": security} if requires_password else {}),
                     }
                 },
-                "/extractor/video.m3u8": {
+                "/extractor/video.{format}": {
                     "get": {
-                        "summary": "Extractor compatibility endpoint with m3u8 suffix",
-                        "description": "Alias for host-forced extractor requests using an m3u8-style path.",
+                        "summary": "Extractor format-suffix variants",
+                        "description": "Format-forced extractor variants. Supported extensions: m3u8, mp4, mpd, ts, m4s, vtt, aac, m4a, webm, mkv, avi, mov. All share the same parameters and handler.",
                         "parameters": [
-                            {"name": "host", "in": "query", "schema": {"type": "string"}},
-                            {"name": "url", "in": "query", "schema": {"type": "string"}},
-                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
-                        ],
-                        "responses": {"200": {"description": "Extractor response"}},
-                        **({"security": security} if requires_password else {}),
-                    }
-                },
-                "/extractor/video.mp4": {
-                    "get": {
-                        "summary": "Extractor compatibility endpoint with mp4 suffix",
-                        "description": "Alias for host-forced extractor requests where the resolved media is typically a direct MP4 stream.",
-                        "parameters": [
+                            {"name": "format", "in": "path", "schema": {"type": "string"}, "required": True},
                             {"name": "host", "in": "query", "schema": {"type": "string"}},
                             {"name": "url", "in": "query", "schema": {"type": "string"}},
                             {"name": "d", "in": "query", "schema": {"type": "string"}},
@@ -391,6 +559,9 @@ class HLSProxyPagesMixin:
                         **({"security": security} if requires_password else {}),
                     }
                 },
+
+                # --- Keys & DRM ---
+
                 "/key": {
                     "get": {
                         "summary": "Fetch or transform decryption keys",
@@ -428,10 +599,13 @@ class HLSProxyPagesMixin:
                         **({"security": security} if requires_password else {}),
                     },
                 },
-                "/generate_urls": {
+
+                # --- Admin API ---
+
+                "/api/admin/login": {
                     "post": {
-                        "summary": "Generate proxy URLs",
-                        "description": "Generate one or multiple compatibility URLs for clients.",
+                        "summary": "Admin login",
+                        "description": "Authenticate as admin. Sets a session cookie on success.",
                         "requestBody": {
                             "required": True,
                             "content": {
@@ -439,35 +613,243 @@ class HLSProxyPagesMixin:
                                     "schema": {
                                         "type": "object",
                                         "properties": {
-                                            "mediaflow_proxy_url": {"type": "string"},
-                                            "api_password": {"type": "string"},
-                                            "urls": {"type": "array", "items": {"type": "object"}},
+                                            "password": {"type": "string"},
                                         },
                                     }
                                 }
                             },
                         },
-                        "responses": {"200": {"description": "Generated URL list"}},
+                        "responses": {"200": {"description": "Login success"}, "401": {"description": "Invalid password"}},
+                    }
+                },
+                "/api/admin/config": {
+                    "get": {
+                        "summary": "Get admin config",
+                        "description": "Retrieve the full server configuration as JSON.",
+                        "responses": {"200": {"description": "Configuration JSON"}},
+                        **({"security": security} if requires_password else {}),
+                    },
+                    "post": {
+                        "summary": "Update admin config",
+                        "description": "Update server configuration with a JSON payload.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object", "description": "Partial or full config update"},
+                                }
+                            },
+                        },
+                        "responses": {"200": {"description": "Config updated"}},
+                        **({"security": security} if requires_password else {}),
+                    },
+                },
+                "/api/admin/config/download": {
+                    "get": {
+                        "summary": "Download config as file",
+                        "description": "Download the current configuration as a downloadable file.",
+                        "responses": {"200": {"description": "Config file download"}},
                         **({"security": security} if requires_password else {}),
                     }
                 },
-                "/playlist": {
+                "/api/admin/config/upload": {
+                    "post": {
+                        "summary": "Upload config file",
+                        "description": "Upload a configuration file to replace the current server config.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {"type": "object", "properties": {"file": {"type": "string", "format": "binary"}}},
+                                }
+                            },
+                        },
+                        "responses": {"200": {"description": "Config uploaded and reloaded"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/api/admin/warp/toggle": {
+                    "post": {
+                        "summary": "Toggle WARP",
+                        "description": "Enable or disable Cloudflare WARP proxy routing.",
+                        "responses": {"200": {"description": "WARP toggled"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/api/admin/warp/reconnect": {
+                    "post": {
+                        "summary": "Reconnect WARP",
+                        "description": "Force WARP to disconnect, re-register, and reconnect.",
+                        "responses": {"200": {"description": "WARP reconnected"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/api/admin/extractor/proxy": {
+                    "post": {
+                        "summary": "Set extractor proxy",
+                        "description": "Override the proxy used by a specific extractor for testing.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "extractor": {"type": "string"},
+                                            "proxy": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "responses": {"200": {"description": "Extractor proxy updated"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/api/admin/speedtest": {
+                    "post": {
+                        "summary": "Run speed test",
+                        "description": "Test download speed through a specified proxy or direct connection.",
+                        "responses": {"200": {"description": "Speed test results"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+
+                # --- DVR / Recordings ---
+
+                "/recordings": {
                     "get": {
-                        "summary": "Build a playlist",
-                        "description": "Combine multiple source URLs into a generated playlist.",
+                        "summary": "Recordings UI page",
+                        "description": "DVR/recording management web interface.",
+                        "responses": {"200": {"description": "HTML page"}},
+                    }
+                },
+                "/record": {
+                    "get": {
+                        "summary": "Start recording via GET",
+                        "description": "Quick-start a recording from a URL query parameter.",
                         "parameters": [
                             {"name": "url", "in": "query", "schema": {"type": "string"}, "required": True},
                             {"name": "api_password", "in": "query", "schema": {"type": "string"}},
                         ],
-                        "responses": {"200": {"description": "Generated playlist"}},
+                        "responses": {"200": {"description": "Recording started"}},
                         **({"security": security} if requires_password else {}),
                     }
                 },
-                "/proxy/ip": {
+                "/record/stop/{id}": {
                     "get": {
-                        "summary": "Resolve public IP",
-                        "description": "Returns the public IP as seen through the configured proxy route.",
-                        "responses": {"200": {"description": "Public IP response"}},
+                        "summary": "Stop recording via GET",
+                        "description": "Stop a recording by ID via GET request.",
+                        "parameters": [
+                            {"name": "id", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Recording stopped"}},
+                    }
+                },
+                "/api/recordings": {
+                    "get": {
+                        "summary": "List recordings",
+                        "description": "Get a paginated list of all recordings, with optional status filter.",
+                        "parameters": [
+                            {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["active", "completed", "failed"]}},
+                        ],
+                        "responses": {"200": {"description": "Recordings list"}},
+                    }
+                },
+                "/api/recordings/active": {
+                    "get": {
+                        "summary": "Active recordings",
+                        "description": "Get a list of currently active recordings.",
+                        "responses": {"200": {"description": "Active recordings list"}},
+                    }
+                },
+                "/api/recordings/start": {
+                    "post": {
+                        "summary": "Start recording",
+                        "description": "Start a new DVR recording for a specified stream URL.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "url": {"type": "string"},
+                                            "stream_type": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "responses": {"200": {"description": "Recording started"}, "400": {"description": "Invalid request"}},
+                    }
+                },
+                "/api/recordings/{id}": {
+                    "get": {
+                        "summary": "Get recording details",
+                        "description": "Retrieve metadata for a specific recording.",
+                        "parameters": [
+                            {"name": "id", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Recording metadata"}},
+                    },
+                    "delete": {
+                        "summary": "Delete recording",
+                        "description": "Delete a recording by ID.",
+                        "parameters": [
+                            {"name": "id", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Recording deleted"}},
+                    },
+                },
+                "/api/recordings/{id}/delete": {
+                    "get": {
+                        "summary": "Delete recording via GET",
+                        "description": "Delete a recording by ID using a GET request (legacy compatibility).",
+                        "parameters": [
+                            {"name": "id", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Recording deleted"}},
+                    }
+                },
+                "/api/recordings/{id}/stop": {
+                    "post": {
+                        "summary": "Stop recording",
+                        "description": "Stop an active recording by ID.",
+                        "parameters": [
+                            {"name": "id", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Recording stopped"}},
+                    }
+                },
+                "/api/recordings/{id}/download": {
+                    "get": {
+                        "summary": "Download recording",
+                        "description": "Download a completed recording file.",
+                        "parameters": [
+                            {"name": "id", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "Recording file download"}},
+                    }
+                },
+                "/api/recordings/{id}/stream": {
+                    "get": {
+                        "summary": "Stream recording",
+                        "description": "Stream a completed recording as HLS.",
+                        "parameters": [
+                            {"name": "id", "in": "path", "schema": {"type": "string"}, "required": True},
+                        ],
+                        "responses": {"200": {"description": "HLS stream"}},
+                    }
+                },
+                "/api/recordings/all": {
+                    "delete": {
+                        "summary": "Delete all recordings",
+                        "description": "Delete all recordings, optionally filtering by status.",
+                        "parameters": [
+                            {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["active", "completed", "failed"]}},
+                        ],
+                        "responses": {"200": {"description": "All matching recordings deleted"}},
                     }
                 },
             },
@@ -496,11 +878,11 @@ class HLSProxyPagesMixin:
             urls_to_process = data.get("urls", [])
 
             # --- LOGGING RICHIESTO ---
-            client_ip = request.remote
+            client_ip = get_client_ip(request)
             exit_strategy = "IP del Server (Diretto)"
-            if GLOBAL_PROXIES:
+            if _shared.GLOBAL_PROXIES:
                 exit_strategy = (
-                    f"Proxy Globale Random (Pool di {len(GLOBAL_PROXIES)} proxy)"
+                    f"Proxy Globale Random (Pool di {len(_shared.GLOBAL_PROXIES)} proxy)"
                 )
 
             logger.info(f"🔄 [Generate URLs] Richiesta da Client IP: {client_ip}")
@@ -528,6 +910,7 @@ class HLSProxyPagesMixin:
                 endpoint = item.get("endpoint", "/proxy/stream")
                 req_headers = item.get("request_headers", {})
                 bypass_warp = item.get("warp") == "off"
+                bypass_proxies = item.get("proxy") == "off"
 
                 # Costruisci query params
                 encoded_url = urllib.parse.quote(dest_url, safe="")
@@ -546,6 +929,10 @@ class HLSProxyPagesMixin:
                 # Aggiungi bypass warp se richiesto
                 if bypass_warp:
                     params.append("warp=off")
+
+                # Aggiungi bypass proxy se richiesto
+                if bypass_proxies:
+                    params.append("proxy=off")
 
                 # Costruisci URL finale
                 query_string = "&".join(params)
@@ -570,11 +957,11 @@ class HLSProxyPagesMixin:
 
         try:
             # Usa un proxy globale se configurato, altrimenti connessione diretta
-            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
+            proxy = random.choice(_shared.GLOBAL_PROXIES) if _shared.GLOBAL_PROXIES else None
 
             # Crea una sessione dedicata con il proxy configurato
             if proxy:
-                logger.info(f"🌍 Checking IP via proxy: {proxy}")
+                logger.info(f"[NET] Checking IP via proxy: {proxy}")
                 connector = ProxyConnector.from_url(proxy)
             else:
                 connector = TCPConnector()
@@ -593,3 +980,337 @@ class HLSProxyPagesMixin:
         except Exception as e:
             logger.error(f"❌ Error fetching IP: {e}")
             return web.Response(text=str(e), status=500)
+
+    async def handle_admin(self, request):
+        if not check_password(request):
+            raise web.HTTPFound('/admin/login')
+        try:
+            html = self._read_template("admin.html")
+            html = html.replace("{{APP_VERSION}}", APP_VERSION)
+            return web.Response(text=html, content_type="text/html")
+        except Exception as e:
+            logger.error(f"Error loading admin page: {e}")
+            return web.Response(text="Admin page error", status=500)
+
+    async def handle_admin_login(self, request):
+        if check_password(request):
+            raise web.HTTPFound('/admin')
+        html = self._read_template("admin_login.html")
+        return web.Response(text=html, content_type="text/html")
+
+    async def handle_admin_api_login(self, request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        password = data.get("password", "")
+        if API_PASSWORD and password != API_PASSWORD:
+            return web.json_response({"error": "Invalid password"}, status=401)
+        resp = web.json_response({"ok": True})
+        resp.set_cookie("admin_token", API_PASSWORD, httponly=True, samesite="lax", max_age=86400 * 30, path="/")
+        return resp
+
+    async def handle_admin_logout(self, request):
+        resp = web.HTTPFound('/admin/login')
+        resp.del_cookie("admin_token", path="/")
+        raise resp
+
+    async def handle_admin_api_get(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        config = config_store.get_all()
+        config["api_password_configured"] = bool(API_PASSWORD)
+        config["app_version"] = APP_VERSION
+        config["warp_status"] = await self.get_warp_status()
+        config["warp_ip"] = getattr(self, '_warp_ip', '')
+        config["available_extractors"] = self._get_available_extractors()
+        config["system_stats"] = get_system_stats()
+        config["active_streams"] = _shared.get_active_streams()
+        return web.json_response(config)
+
+    def _get_available_extractors(self):
+        import extractors.registry as _reg
+        names = []
+        suffix = "Extractor"
+        for attr_name in dir(_reg):
+            if attr_name.endswith(suffix) and attr_name != "ExtractorError":
+                cls = getattr(_reg, attr_name, None)
+                if cls is not None:
+                    short = attr_name[:-len(suffix)].lower()
+                    names.append(short)
+        return sorted(names)
+
+    async def handle_admin_api_update(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400, text="Invalid JSON body")
+
+        allowed_keys = {
+            "enable_warp", "warp_license_key",
+            "global_proxies", "transport_routes", "extractor_proxies",
+            "warp_off_extractors", "proxy_off_extractors", "warp_exclude_domains_custom", "proxy_exclude_domains",
+            "dvr_enabled",
+            "max_recording_duration", "recordings_retention_days",
+            "proxy_test_timeout", "proxy_test_concurrency",
+            "log_level",
+        }
+
+        updates = {}
+        for key, value in data.items():
+            if key in allowed_keys:
+                updates[key] = value
+
+        if updates:
+            config_store.update(updates)
+            reload_config()
+            clear_proxy_affinity()
+            # Invalidate extractor cache if proxy/routing/WARP settings changed
+            if any(k in updates for k in ("global_proxies", "extractor_proxies", "transport_routes", "warp_off_extractors", "proxy_off_extractors", "warp_exclude_domains_custom", "proxy_exclude_domains", "enable_warp")):
+                self.extractors.clear()
+                logger.info("Extractor cache cleared due to config change")
+
+        return web.json_response({"status": "ok", "updated": list(updates.keys())})
+
+    async def handle_admin_api_warp_toggle(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400, text="Invalid JSON body")
+
+        enable = data.get("enable", False)
+        config_store.set("enable_warp", bool(enable))
+        reload_config()
+        clear_proxy_affinity()
+        self.extractors.clear()
+
+        if enable:
+            logger.info("WARP enabled via admin panel")
+            result = await self.reconnect_warp()
+            if result.get("status") != "ok":
+                logger.warning(f"WARP enable failed: {result.get('message')}")
+                return web.json_response({"status": "error", "message": result.get("message", "WARP connect failed")}, status=500)
+        else:
+            logger.info("WARP disabled via admin panel")
+            await self._stop_warp_proxy()
+
+        return web.json_response({"status": "ok", "warp": "enabled" if enable else "disabled"})
+
+    async def handle_admin_api_warp_reconnect(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        result = await self.reconnect_warp()
+        status_code = 200 if result.get("status") == "ok" else 500
+        return web.json_response(result, status=status_code)
+
+    async def handle_admin_api_extractor_proxy(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400, text="Invalid JSON body")
+
+        extractor = data.get("extractor")
+        proxy = data.get("proxy", "")
+        ptype = data.get("type", "proxy")
+
+        if not extractor:
+            return web.Response(status=400, text="Missing 'extractor' field")
+
+        extractor_proxies = config_store.get("extractor_proxies", {})
+        if proxy:
+            if ptype == "file":
+                extractor_proxies[extractor.lower()] = {"file": proxy}
+            else:
+                extractor_proxies[extractor.lower()] = proxy
+        else:
+            extractor_proxies.pop(extractor.lower(), None)
+
+        config_store.set("extractor_proxies", extractor_proxies)
+        reload_config()
+        clear_proxy_affinity()
+        self.extractors.clear()
+
+        return web.json_response({"status": "ok", "extractor": extractor, "proxy": proxy or None})
+
+    async def handle_admin_api_download(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        data = config_store.get_all()
+        json_str = json.dumps(data, indent=2)
+        return web.Response(
+            body=json_str,
+            content_type="application/json",
+            headers={
+                "Content-Disposition": 'attachment; filename="easyproxy_config.json"'
+            }
+        )
+
+    async def handle_admin_api_upload(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        try:
+            reader = await request.multipart()
+            field = await reader.next()
+            if not field or field.name != "config":
+                return web.Response(status=400, text="Missing 'config' file field")
+            raw = await field.read()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return web.Response(status=400, text="Config must be a JSON object")
+            config_store.replace_all(data)
+            reload_config()
+            clear_proxy_affinity()
+            self.extractors.clear()
+            return web.json_response({"status": "ok", "message": "Config imported successfully"})
+        except json.JSONDecodeError:
+            return web.Response(status=400, text="Invalid JSON file")
+        except Exception as e:
+            logger.error(f"Config upload failed: {e}")
+            return web.Response(status=500, text=f"Upload failed: {e}")
+
+    async def handle_admin_api_speedtest(self, request):
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized")
+        try:
+            routes = [{"name": "Direct", "proxy": None}]
+            from config import WARP_PROXY_URL
+            if config_store.get("enable_warp", False):
+                routes.append({"name": "Via WARP", "proxy": WARP_PROXY_URL})
+            global_proxies = config_store.get("global_proxies", [])
+            if global_proxies:
+                routes.append({"name": "Via Proxy", "proxy": global_proxies[0]})
+            from concurrent.futures import ThreadPoolExecutor
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor(max_workers=len(routes)) as pool:
+                futures = [loop.run_in_executor(pool, self._run_speedtest, r["proxy"]) for r in routes]
+                results = await asyncio.gather(*futures, return_exceptions=True)
+            output = []
+            for i, r in enumerate(routes):
+                res = results[i]
+                if isinstance(res, Exception):
+                    output.append({"name": r["name"], "error": str(res)})
+                else:
+                    res["name"] = r["name"]
+                    output.append(res)
+            return web.json_response({"results": output})
+        except Exception as e:
+            logger.error(f"Speedtest failed: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    def _ensure_speedtest_exe(self):
+        import subprocess
+        import os as _os
+        import platform as _platform
+        home = _os.path.expanduser("~")
+        auto_install_paths = [
+            _os.path.join(_os.environ.get("LOCALAPPDATA", home), "OoklaSpeedtest", "speedtest.exe"),
+            _os.path.join(home, ".local", "share", "easyproxy", "bin", "speedtest"),
+        ]
+        system_paths = [
+            "/usr/local/bin/speedtest",
+            "/usr/bin/speedtest",
+            "speedtest.exe",
+            "speedtest",
+        ]
+        for p in auto_install_paths + system_paths:
+            if _os.path.exists(p):
+                return p
+        found = shutil.which("speedtest")
+        if found:
+            return found
+
+        # Auto-download Ookla Speedtest CLI
+        system = _platform.system().lower()
+        machine = _platform.machine().lower()
+        version = "1.2.0"
+        try:
+            if system in ("windows", "win32"):
+                url = f"https://install.speedtest.net/app/cli/ookla-speedtest-{version}-win64.zip"
+                install_dir = _os.path.dirname(auto_install_paths[0])
+                target = auto_install_paths[0]
+                member = "speedtest.exe"
+                archive_cls = zipfile.ZipFile
+                archive_mode = "r"
+            elif system == "linux":
+                arch_map = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
+                arch = arch_map.get(machine)
+                if not arch:
+                    raise RuntimeError(f"Unsupported Linux architecture: {machine}")
+                url = f"https://install.speedtest.net/app/cli/ookla-speedtest-{version}-linux-{arch}.tgz"
+                install_dir = _os.path.dirname(auto_install_paths[1])
+                target = auto_install_paths[1]
+                member = "speedtest"
+                archive_cls = tarfile.open
+                archive_mode = "r:gz"
+            else:
+                raise RuntimeError(f"Auto-install not supported on {system}. Please install Ookla Speedtest CLI manually.")
+
+            _os.makedirs(install_dir, exist_ok=True)
+            suffix = ".zip" if system in ("windows", "win32") else ".tgz"
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            _os.close(fd)
+            try:
+                urllib.request.urlretrieve(url, tmp_path)
+                with archive_cls(tmp_path, archive_mode) as archive:
+                    archive.extract(member, install_dir)
+                _os.chmod(target, 0o755)
+            finally:
+                if _os.path.exists(tmp_path):
+                    _os.remove(tmp_path)
+            return target
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to auto-install Speedtest CLI: {e}.\n"
+                "Install it manually:\n"
+                "  Windows: https://www.speedtest.net/apps/cli\n"
+                "  Linux: sudo apt install speedtest\n"
+                "  Docker: see Dockerfile"
+            )
+
+    def _run_speedtest(self, proxy_url=None):
+        import subprocess
+        import os as _os
+        exe = self._ensure_speedtest_exe()
+        try:
+            env = None
+            if proxy_url:
+                env = _os.environ.copy()
+                # Socks5h per WARP, HTTP per proxy normali
+                if "socks5" in proxy_url:
+                    env["ALL_PROXY"] = proxy_url
+                else:
+                    env["HTTPS_PROXY"] = proxy_url
+                    env["HTTP_PROXY"] = proxy_url
+            result = subprocess.run(
+                [exe, "--format", "json", "--accept-license", "--accept-gdpr"],
+                capture_output=True, text=True, timeout=60, env=env
+            )
+            if result.returncode != 0:
+                err = result.stderr
+                if "Network is unreachable" in err or "Cannot retrieve configuration" in err:
+                    if proxy_url:
+                        raise RuntimeError(f"Connection refused by proxy: {proxy_url}. Make sure WARP is connected or the proxy is reachable.")
+                    else:
+                        raise RuntimeError("No internet connection. Check your network.")
+                raise RuntimeError(f"Speedtest failed: {err.split('[')[-1].rstrip(']') if '[' in err else err[:100]}")
+            data = json.loads(result.stdout)
+            return {
+                "server": {
+                    "sponsor": data.get("server", {}).get("sponsor", "Unknown"),
+                    "name": data.get("server", {}).get("name", "Unknown"),
+                    "location": data.get("server", {}).get("location", "Unknown")
+                },
+                "download_mbps": round(data.get("download", {}).get("bandwidth", 0) * 8 / 1_000_000, 1),
+                "upload_mbps": round(data.get("upload", {}).get("bandwidth", 0) * 8 / 1_000_000, 1),
+                "ping_ms": round(data.get("ping", {}).get("latency", 0), 1)
+            }
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Speedtest timed out after 60 seconds")
+        except json.JSONDecodeError:
+            raise RuntimeError("Failed to parse speedtest output")

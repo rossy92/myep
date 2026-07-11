@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
-
+import config_store
 from services.recording_db import RecordingDB
 from config import PORT, API_PASSWORD
 
@@ -38,23 +38,35 @@ class StreamConfig:
 
 
 class RecordingManager:
-    """Manages FFmpeg recording processes for DVR functionality."""
+    """Manages recording processes for DVR functionality."""
 
     # Stream types that benefit from reconnection (proxy handles token refresh)
     RECONNECT_TYPES = {StreamType.VAVOO, StreamType.FREESHOT,
                        StreamType.SPORTSONLINE, StreamType.MPD}
 
-    def __init__(self, recordings_dir: str, max_duration: int = 28800,
-                 retention_days: int = 7):
+    def __init__(self, recordings_dir: str):
         self.recordings_dir = recordings_dir
-        self.max_duration = max_duration
-        self.retention_days = retention_days
+        if not os.path.exists(self.recordings_dir):
+            os.makedirs(self.recordings_dir)
         self.db = RecordingDB(recordings_dir)
         self.processes: Dict[str, asyncio.subprocess.Process] = {}
         self.start_times: Dict[str, float] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._monitor_tasks: Dict[str, asyncio.Task] = {}
 
-        if not os.path.exists(self.recordings_dir):
-            os.makedirs(self.recordings_dir)
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30, connect=10),
+                connector=aiohttp.TCPConnector(limit=10),
+            )
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     # =========================================================================
     # Stream Type Detection
@@ -108,7 +120,7 @@ class RecordingManager:
 
         MPD streams are converted to HLS by the proxy and may have:
         - ClearKey DRM requiring decryption parameters
-        - Separate audio tracks requiring dual-input FFmpeg
+        - Separate audio tracks requiring dual-input recorder
         """
         proxy_params = self._build_proxy_params(url)
 
@@ -185,11 +197,10 @@ class RecordingManager:
             audio_playlist_url may be None if audio is embedded in video
         """
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    master_url,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as resp:
+            async with self.session.get(
+                master_url,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
                     if resp.status != 200:
                         logger.error(f"Failed to fetch master playlist: {resp.status}")
                         return None, None
@@ -338,13 +349,17 @@ class RecordingManager:
             return None
 
         filename = self._generate_filename(recording_id, name)
-        file_path = os.path.join(self.recordings_dir, filename)
+        recordings_dir = config_store.get("recordings_dir", self.recordings_dir)
+        file_path = os.path.join(recordings_dir, filename)
+        if not os.path.exists(recordings_dir):
+            os.makedirs(recordings_dir)
 
         # Apply duration limits
+        max_duration = config_store.get("max_recording_duration", 28800)
         if duration:
-            duration = min(duration, self.max_duration)
+            duration = min(duration, max_duration)
         else:
-            duration = self.max_duration
+            duration = max_duration
 
         # Prepare stream-specific configuration
         config = await self._prepare_stream_config(url, clearkey)
@@ -373,7 +388,8 @@ class RecordingManager:
                 pid=process.pid
             )
 
-            asyncio.create_task(self._monitor_recording(recording_id, process))
+            task = asyncio.create_task(self._monitor_recording(recording_id, process))
+            self._monitor_tasks[recording_id] = task
 
             return self.db.get_recording(recording_id)
 
@@ -396,7 +412,6 @@ class RecordingManager:
         if recording_id in self.processes:
             process = self.processes[recording_id]
             try:
-                # Send 'q' to FFmpeg for graceful shutdown
                 if process.stdin:
                     process.stdin.write(b'q')
                     await process.stdin.drain()
@@ -421,6 +436,9 @@ class RecordingManager:
             finally:
                 self.processes.pop(recording_id, None)
                 self.start_times.pop(recording_id, None)
+                task = self._monitor_tasks.pop(recording_id, None)
+                if task and not task.done():
+                    task.cancel()
         else:
             # Process in different worker - use PID from database
             pid = recording.get('pid')
@@ -465,7 +483,7 @@ class RecordingManager:
             stderr_text = stderr.decode() if stderr else ""
 
             if stderr_text:
-                logger.debug(f"Recording {recording_id} FFmpeg output: {stderr_text[:1000]}")
+                logger.debug(f"Recording {recording_id} recorder output: {stderr_text[:1000]}")
 
             if process.returncode == 0:
                 logger.info(f"Recording {recording_id} completed successfully")
@@ -490,6 +508,7 @@ class RecordingManager:
         finally:
             self.processes.pop(recording_id, None)
             self.start_times.pop(recording_id, None)
+            self._monitor_tasks.pop(recording_id, None)
 
     async def delete_recording(self, recording_id: str) -> bool:
         """Delete a recording and its file."""
@@ -553,7 +572,8 @@ class RecordingManager:
 
     async def cleanup_old_recordings(self):
         """Delete recordings older than retention period."""
-        old_recordings = self.db.get_old_recordings(self.retention_days)
+        retention = config_store.get("recordings_retention_days", 7)
+        old_recordings = self.db.get_old_recordings(retention)
         for recording in old_recordings:
             logger.info(f"Auto-deleting old recording: {recording['id']}")
             await self.delete_recording(recording['id'])
@@ -572,6 +592,12 @@ class RecordingManager:
         logger.info("Shutting down RecordingManager...")
         for recording_id in list(self.processes.keys()):
             await self.stop_recording(recording_id)
+        for task in list(self._monitor_tasks.values()):
+            if not task.done():
+                task.cancel()
+        if self._monitor_tasks:
+            await asyncio.wait(list(self._monitor_tasks.values()), timeout=5)
+        await self.close()
 
     # =========================================================================
     # Helper Methods

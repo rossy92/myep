@@ -3,21 +3,18 @@ VidXgo extractor.
 
 Decodes the obfuscated player at v.vidxgo.co / vidxgo.* and returns the master
 HLS playlist. CDN signed URLs on the .ts segments have a ~5 min TTL. Always
-re-fetches the embed page on each extract() call to get fresh tokens. Transforms
-the VOD manifest into an "EVENT" / live one by removing `#EXT-X-ENDLIST`, so the
-player keeps re-fetching the manifest and EP gets a chance to serve a
-freshly-extracted segment URL list before the CDN tokens expire.
+re-fetches the embed page on each extract() call to get fresh tokens.
 """
 
-import asyncio
 import base64
 import logging
 import re
+import time
 from urllib.parse import urlparse, parse_qs
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 
-from config import GLOBAL_PROXIES, TRANSPORT_ROUTES, get_proxy_for_url, get_connector_for_proxy
+from config import get_connector_for_proxy, get_ordered_proxies_for_url, should_allow_direct_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -111,20 +108,15 @@ class VidXgoExtractor:
     # ------------------------------------------------------------------ proxies
 
     def _get_proxies_for_url(self, url: str) -> list[str]:
-        ordered = []
-        for p in self.proxies:
-            if p and p not in ordered:
-                ordered.append(p)
-        route_proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES)
-        if route_proxy and route_proxy not in ordered:
-            ordered.append(route_proxy)
-        return ordered
+        return get_ordered_proxies_for_url(url, self.extractor_name, self.proxies)
 
     # ------------------------------------------------------------------ fetch
 
     async def _fetch(self, url: str, headers: dict) -> str:
-        """GET `url` trying direct first, then each configured proxy."""
-        paths = [None] + self._get_proxies_for_url(url)
+        """GET `url`; direct is allowed only when no proxy is configured."""
+        paths = self._get_proxies_for_url(url)
+        if should_allow_direct_fallback(paths):
+            paths.append(None)
         last_error = None
         for proxy in paths:
             timeout = ClientTimeout(total=25, connect=10, sock_read=20)
@@ -182,34 +174,6 @@ class VidXgoExtractor:
             raise ExtractorError("VidXgo: source is marked corrupt or not available")
         raise ExtractorError("VidXgo: could not locate currentSrc m3u8 in any decoded script")
 
-    # ------------------------------------------------------------------ manifest transform
-
-    @staticmethod
-    def _make_live(manifest_text: str) -> str:
-        """
-        Turn a VOD playlist into an EVENT/live one so the player re-fetches
-        the manifest periodically. This gives EP the chance to call
-        extract() again and serve fresh segment URLs.
-        """
-        if not manifest_text:
-            return manifest_text
-        # Drop the end-of-stream marker so the player keeps polling.
-        out_lines = []
-        for line in manifest_text.splitlines():
-            s = line.strip()
-            if s == "#EXT-X-ENDLIST":
-                continue
-            if s.startswith("#EXT-X-PLAYLIST-TYPE"):
-                out_lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
-                continue
-            out_lines.append(line)
-        if not any(l.startswith("#EXT-X-PLAYLIST-TYPE") for l in out_lines):
-            for i, l in enumerate(out_lines):
-                if l.strip() == "#EXTM3U":
-                    out_lines.insert(i + 1, "#EXT-X-PLAYLIST-TYPE:EVENT")
-                    break
-        return "\n".join(out_lines)
-
     # ------------------------------------------------------------------ public API
 
     async def extract(self, url: str, **kwargs) -> dict:
@@ -234,9 +198,10 @@ class VidXgoExtractor:
         playback_headers = {
             **self.playback_headers,
             "referer": f"{vd_domain}/",
-            "origin": vd_domain,
+"origin": vd_domain,
         }
 
+        bypass_warp = bool(kwargs.get("bypass_warp"))
         # 1. Fetch embed page.
         embed_headers = {**self.embed_headers, **{k.lower(): v for k, v in request_headers.items() if k.lower() == "cookie"}}
         html = await self._fetch(url, embed_headers)
@@ -251,8 +216,6 @@ class VidXgoExtractor:
         master_text = await self._fetch(m3u8_url, playback_headers)
         if "#EXTM3U" not in master_text:
             raise ExtractorError("VidXgo: extracted URL did not return a valid HLS manifest")
-        if "#EXTINF" in master_text:
-            master_text = self._make_live(master_text)
 
         from urllib.parse import urljoin
         captured_map: dict[str, str] = {}
@@ -273,26 +236,16 @@ class VidXgoExtractor:
                     if media_url not in variant_urls:
                         variant_urls.append(media_url)
 
-        async def _grab(v_url: str) -> tuple[str, str | None]:
+        for v_url in variant_urls:
             try:
-                txt = await self._fetch(v_url, playback_headers)
-                return v_url, txt
+                v_text = await self._fetch(v_url, playback_headers)
+                captured_map[v_url] = v_text
             except Exception as e:
                 logger.warning(f"vidxgo: variant fetch failed {v_url[:80]}...: {e}")
-                return v_url, None
-
-        if variant_urls:
-            results = await asyncio.gather(*[_grab(v) for v in variant_urls])
-            for v_url, v_text in results:
-                if not v_text:
-                    continue
-                if "#EXTINF" in v_text:
-                    v_text = self._make_live(v_text)
-                captured_map[v_url] = v_text
 
         captured_map[m3u8_url] = master_text
 
-        return {
+        result = {
             "destination_url": m3u8_url,
             "request_headers": playback_headers,
             "captured_manifest": master_text,
@@ -300,6 +253,7 @@ class VidXgoExtractor:
             "mediaflow_endpoint": self.mediaflow_endpoint,
             "selected_proxy": self.selected_proxy,
         }
+        return result
 
     async def close(self):
         if self.session and not self.session.closed:
